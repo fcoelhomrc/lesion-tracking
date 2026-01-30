@@ -9,11 +9,13 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
   "monai",
+  "nibabel",
   "napari[all]",
   "torch",
   "torchvision",
   "lightning",
   "rich",
+  "matplotlib",
 ]
 
 [[tool.uv.index]]
