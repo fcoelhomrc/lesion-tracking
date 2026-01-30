@@ -7,7 +7,27 @@ authors = [
     { name = "Felipe Coutinho", email = "fcoelho.mrc@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "monai",
+  "napari[all]",
+  "torch",
+  "torchvision",
+  "lightning",
+  "rich",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
 
 [project.scripts]
 lesion-tracking = "lesion_tracking:main"
