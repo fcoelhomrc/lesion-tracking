@@ -6,6 +6,9 @@ from rich.logging import RichHandler
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
+# Shared console instance for coordinated Rich output
+console = Console(stderr=True)
+
 
 def get_logger(
     name: str,
@@ -22,7 +25,7 @@ def get_logger(
     logger.setLevel(level)
 
     handler = RichHandler(
-        console=Console(stderr=True),
+        console=console,
         show_path=show_path,
         show_time=show_time,
         rich_tracebacks=True,
