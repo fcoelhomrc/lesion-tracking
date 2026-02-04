@@ -16,6 +16,8 @@ dependencies = [
   "lightning",
   "rich",
   "matplotlib",
+  "connected-components-3d>=3.26.1",
+  "einops>=0.8.2",
 ]
 
 [[tool.uv.index]]
