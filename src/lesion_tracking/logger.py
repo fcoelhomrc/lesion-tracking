@@ -1,5 +1,6 @@
 import logging
-from typing import Literal
+from time import perf_counter
+from typing import Callable, Literal
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -35,3 +36,19 @@ def get_logger(
     logger.addHandler(handler)
 
     return logger
+
+
+def track_runtime(logger: logging.Logger | None, buffer: list):
+    def decorator(f: Callable):
+        def f_timed(*args, **kwargs):
+            start = perf_counter()
+            outputs = f(*args, **kwargs)
+            elapsed = perf_counter() - start  # seconds
+            if logger:
+                logger.info(f"Callable {f.__name__} executed in {elapsed:.4f} seconds")
+            buffer.append(elapsed)
+            return outputs
+
+        return f_timed
+
+    return decorator
