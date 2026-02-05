@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Literal, Mapping, Optional
+from typing import Any, Iterator, Literal, Mapping, Optional
 
 import einops
 import torch
@@ -130,12 +130,13 @@ class LongitudinalDataset(Dataset):
     def __init__(
         self,
         dataset_path: str | Path,
-        reader_backend: str = "nibabel",
+        preprocessing_config: dict = {"spacing": (1.0, 1.0, 1.0)},
         caching_strategy: Literal["ram", "disk"] | None = "disk",
         cache_dir: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self.reader_backend = reader_backend
+        self._preprocessing_config = preprocessing_config
+        self._caching_strategy = caching_strategy
 
         self._prepare_full_pipeline()
         self._prepare_dataset(
@@ -194,14 +195,14 @@ class LongitudinalDataset(Dataset):
     def num_cases(self) -> int:
         return len(self._cases)
 
-    def get_tps_for_case(self, case_id: str):
+    def _get_tps_for_case(self, case_id: str):
         tp = self._map_case_to_tp.get(case_id)
         if tp is None:
             raise ValueError(f"Invalid case_id: {case_id}")
         return tp
 
-    def iterate_tps_for_case(self, case_id: str):
-        tps = self.get_tps_for_case(case_id)
+    def _iterate_tps_for_case(self, case_id: str):
+        tps = self._get_tps_for_case(case_id)
         for tp in range(len(tps)):  # Guarantees ordered iteration
             idx = tps.get(tp)  # Global index for this particular (case, tp)
             yield idx
@@ -209,11 +210,28 @@ class LongitudinalDataset(Dataset):
     def __len__(self) -> int:
         return self.num_cases()
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> dict:
+        """
+        Output: dict
+        Keys:
+            case_id - patient identifier
+            metadata - dict with all available metadata
+            contents - list with items {scan, mask}, ordered in time
+        Batch (needs longitudinal_collate_fn):
+            metadata - list of 'metadata' dicts
+            contents - list of 'contents' lists
+        """
         # FIXME: this loop returns early, so this implementation is wrong
         case_id = self._cases[idx]
-        for idx in self.iterate_tps_for_case(case_id=case_id):
-            return self._base_dataset[idx]  # Handles all transforms
+        item = {
+            "case_id": case_id,
+            "metadata": self._metadata.get(case_id),
+            "contents": [],
+        }
+        for idx in self._iterate_tps_for_case(case_id=case_id):
+            # Handles all transforms (load, preprocessing, augmentation)
+            item["contents"].append(self._base_dataset[idx])
+        return item
 
     def _prepare_loader(self):
         """
@@ -241,7 +259,7 @@ class LongitudinalDataset(Dataset):
                 # Resampling
                 Spacingd(
                     keys=["scan", "mask"],
-                    pixdim=(1.0, 1.0, 1.0),
+                    pixdim=self._preprocessing_config["spacing"],
                     mode=("bilinear", "nearest"),
                 ),
                 # Z-score normalization
@@ -266,158 +284,42 @@ class LongitudinalDataset(Dataset):
             ],
         ).flatten()
 
-
-class OldLongitudinalDataset(Dataset):
-    """
-    Each sample is a sequence of scans at different timepoints.
-    """
-
-    def __init__(self, dataset_path: str | Path, reader_backend="nibabel") -> None:
-        super().__init__()
-
-        self.reader_backend = reader_backend
-
-        self._prepare_dataset(dataset_path)
-        self.num_cases = len(self.samples)
-
-        self._prepare_full_pipeline()
-
-    def _prepare_dataset(self, path):
-        self.samples, self.metadata = scan_dataset_dir(path, require_masks=True)
-
-    def _prepare_loader(self):
-        """
-        Prepares a MONAI pipeline to perform:
-
-            1. Read image from disk
-            2. Reorient to RAS
-            3. Resample to unit volume
-            4. Normalize with z-score method
-
-        The API handles differences in preprocessing steps between volumes and segmentation masks,
-        while automatically updating the affine matrix.
-        """
-        self._loading_pipeline = Compose(
-            [
-                LoadImaged(
-                    keys=["scans", "masks"],
-                    reader="NibabelReader",
-                    as_closest_canonical=True,
-                    squeeze_non_spatial_dims=True,
-                ),
-                EnsureChannelFirstd(keys=["scans", "masks"]),
-                # Reorienting
-                Orientationd(keys=["scans", "masks"], axcodes="RAS", labels=None),
-                # Resampling
-                Spacingd(
-                    keys=["scans", "masks"],
-                    pixdim=(1.0, 1.0, 1.0),
-                    mode=("bilinear", "nearest"),
-                ),
-                # Z-score normalization
-                NormalizeIntensityd(
-                    keys=["scans"],
-                    channel_wise=True,
-                ),
-            ],
-        )
-
-    def _prepare_augmentations(self): ...
-
-    def _prepare_full_pipeline(self):
-        self._prepare_loader()
-        self._prepare_augmentations()
-        self._full_pipeline = Compose(
-            [
-                self._loading_pipeline,
-                ToTensord(keys=["scans", "masks"]),
-                AsDiscreted(keys=["masks"]),
-                # self._augmentation_pipeline,
-            ],
-        ).flatten()
-
-    def _get_metadata(self, idx) -> Optional[Any]:
-        case_id = self.samples[idx].get("case_id")
-        if case_id:
-            return self.metadata.get(case_id)
-
-    def __len__(self):
-        return self.num_cases
-
-    def __getitem__(self, idx):
-        """
-        Output:
-            dict with keys
-            scans -> list of L tensors with shape (C, H, W, D)
-            masks -> list of L tensors with shape (C, H, W, D)
-            case_id -> str with patient identifier
-        """
-        sample = self.samples[idx]
-        num_timepoints = len(sample["scans"])
-        logger.debug(
-            f"Retrieving sample {idx} ({sample['case_id']}) -> Found {num_timepoints} timepoints"
-        )
-
-        output = {
-            "case_id": sample["case_id"],
-            "metadata": self._get_metadata(idx),
-            "scans": [],
-            "masks": [],
-        }
-        for i in range(num_timepoints):
-            tmp = {"scans": sample["scans"][i], "masks": sample["masks"][i]}
-            tmp_out = self._full_pipeline(tmp)
-            assert isinstance(tmp_out, dict), (
-                f"Unexpected type after loading pipeline: {type(tmp_out)}"
+    def refresh_cache(self):
+        if self._caching_strategy is not None:
+            self._base_dataset.set_data(
+                [self._map_idx_to_data[i] for i in range(len(self._map_idx_to_data))]
             )
-            self._fill_lists_from_dict(output, tmp_out)
-
-        return output
-
-    @staticmethod
-    def _fill_lists_from_dict(d1: Mapping, d2: Mapping):
-        """
-        d1: Mapping where some keys point to lists
-        d2: Fill d1 lists with d2 values from matching keys
-        """
-        for k2, v2 in d2.items():
-            if k2 in d1 and isinstance(d1[k2], list):
-                d1[k2].append(v2)
 
 
 def longitudinal_collate_fn(batch):
     """Custom collate that handles variable-length sequences."""
     return {
-        "case_id": [item["case_id"] for item in batch],  # List[Str]
-        "metadata": [item.get("metadata") for item in batch],  # List[Dict[Str, Any]]
-        "scans": [item["scans"] for item in batch],  # List[List[Tensor]]
-        "masks": [item["masks"] for item in batch],  # List[List[Tensor]]
+        "case_id": [item.get("case_id") for item in batch],
+        "metadata": [item.get("metadata") for item in batch],
+        "contents": [item["contents"] for item in batch],
     }
 
 
-def iterate_over_batch(batch):
+def iterate_over_cases(batch) -> Iterator[tuple[str, dict]]:
     """
-    Unpacks N samples (different patients)
-    Iterator -> Str, List[Tensor], List[Tensor]
+    Iterator yields the packed sequence for each case in batch
     """
     batched_case_ids = batch.get("case_id")
-    batched_scans = batch.get("scans")
-    batched_masks = batch.get("masks")
-    for case_id, scans, masks in zip(batched_case_ids, batched_scans, batched_masks):
-        yield case_id, scans, masks
+    batched_contents = batch.get("contents")
+    for case_id, contents in zip(batched_case_ids, batched_contents):
+        yield case_id, contents
 
 
-def iterate_over_timepoints(batch):
+def iterate_over_cases_and_timepoints(batch, include_case_id=False) -> Iterator[tuple]:
     """
-    Unpacks L_n timepoints from N different patients
-    Iterator -> Str, Tensor, Tensor
+    Iterator yields the unpacked sequence from each (case, timepoint) in batch
     """
-    for case_id, scans, masks in iterate_over_batch(batch):
-        assert len(scans) == len(masks), (
-            f"Found mismatched {len(scans)} scans and {len(masks)} masks during iteration"
-        )
-        for scan, mask in zip(scans, masks):
-            yield case_id, scan, mask
+    for case_id, contents in iterate_over_cases(batch):
+        for each in contents:
+            if include_case_id:
+                yield case_id, each.get("scan"), each.get("mask")
+            else:
+                yield each.get("scan"), each.get("mask")
 
 
 def without_channel(x: torch.Tensor) -> torch.Tensor:
@@ -426,9 +328,15 @@ def without_channel(x: torch.Tensor) -> torch.Tensor:
     return einops.rearrange(x, "1 h w d -> h w d")
 
 
-# TODO: add splits, custom collate, cache dataset? persistent dataset? custom sampling strategies?
-def get_loader(dataset_path, batch_size=1, shuffle=False, num_workers=1):
-    dataset = LongitudinalDataset(dataset_path=dataset_path)
+# TODO: add splits, custom sampling strategies?
+def get_loader(
+    dataset_path, preprocessing_config, batch_size=1, shuffle=False, num_workers=1
+):
+    dataset = LongitudinalDataset(
+        dataset_path=dataset_path,
+        preprocessing_config=preprocessing_config,
+        caching_strategy="disk",
+    )
     loader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
