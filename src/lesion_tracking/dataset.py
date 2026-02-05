@@ -6,6 +6,8 @@ from time import perf_counter
 from typing import Any, Iterator, Literal, Mapping, Optional
 
 import einops
+import numpy as np
+import pandas as pd
 import torch
 from monai.data import MetaTensor
 from monai.data.image_reader import ImageReader, NibabelReader
@@ -21,7 +23,7 @@ from monai.transforms import (
     ToTensord,
 )
 from numpy.typing import NDArray
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from lesion_tracking.logger import get_logger, track_runtime
 
@@ -221,7 +223,8 @@ class LongitudinalDataset(Dataset):
             metadata - list of 'metadata' dicts
             contents - list of 'contents' lists
         """
-        # FIXME: this loop returns early, so this implementation is wrong
+        # FIXME: metadata already contains case_id key, either remove redundancy or use it for sanity check
+        # FIXME: need to handle "targets" better - perhaps trim down metadata?
         case_id = self._cases[idx]
         item = {
             "case_id": case_id,
@@ -328,15 +331,120 @@ def without_channel(x: torch.Tensor) -> torch.Tensor:
     return einops.rearrange(x, "1 h w d -> h w d")
 
 
+def generate_folds(
+    dataset_path: str | Path,
+    overwrite: bool = False,
+    test_size: float = 0.5,
+    num_folds: int = 5,  # Non-overlapping folds!
+    seed: int = 0,
+    stratified: bool = False,
+    stratification_key: Optional[str] = None,
+) -> None:
+    """
+    Pre-computes folds and save them to file for later use.
+    """
+    import json
+
+    from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+    from torch.utils.data import Subset
+
+    folds_json = Path(dataset_path) / "folds.json"
+    if folds_json.exists() and not overwrite:
+        logger.warning(
+            f"Found existing folds at {str(folds_json)}! Skipping operation..."
+        )
+        return
+    if folds_json.exists() and overwrite:
+        logger.debug(f"Overwriting {str(folds_json)}...")
+
+    assert 0.0 < test_size < 1.0, f"Test size must be between 0 and 1, got {test_size}"
+    if stratified:
+        assert stratification_key is not None, "Missing stratification key"
+
+    dataset = LongitudinalDataset(dataset_path=dataset_path)
+    results = {
+        "stratified": stratified,
+        "stratification_key": stratification_key,
+    }  # fold: {train, val, test}
+
+    if stratified:
+        # TODO: finish implementation.
+        # Need to work on metadata/targets on dataset implementation.
+        indices = [i for i in range(len(dataset))]
+        targets = []
+
+        train_val_indices, test_indices, train_val_targets, test_targets = (
+            train_test_split(indices, targets, test_size=test_size, random_state=seed)
+        )
+
+        folds = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+        for i, (train_indices, val_indices) in enumerate(
+            folds.split(train_val_indices, train_val_targets)
+        ):
+            pass
+
+    else:
+        indices = [i for i in range(len(dataset))]
+
+        # Generate held-out test set
+        train_val_indices, test_indices = train_test_split(
+            indices, test_size=test_size, random_state=seed
+        )
+
+        # Generate non-overlapping splits
+        folds = KFold(n_splits=num_folds, shuffle=True, random_state=seed)
+        for i, (train_indices, val_indices) in enumerate(
+            folds.split(train_val_indices)
+        ):
+            # Keep indexing consistent
+            train_indices = np.asarray(train_val_indices)[train_indices].tolist()
+            val_indices = np.asarray(train_val_indices)[val_indices].tolist()
+            # Store results
+            results[i] = {
+                "train": train_indices,
+                "val": val_indices,
+                "test": test_indices,
+            }
+
+    json.dump(results, folds_json.open("w"))
+    return
+
+
+def load_folds(
+    dataset_path: str | Path, fold: int, split: Literal["train", "val", "test"]
+) -> list[int]:
+    folds_json = Path(dataset_path) / "folds.json"
+    folds = json.load(folds_json.open())
+    train_val_test: dict | None = folds.get(str(fold))
+    assert train_val_test is not None, f"Fold {fold} not found in {str(folds_json)}"
+    assert isinstance(train_val_test, dict), "Failed loading folds. Check format."
+    assert split in train_val_test, (
+        f"Missing split {split} in fold {fold} (Available: {[s for s in train_val_test]})"
+    )
+    return train_val_test[split]
+
+
 # TODO: add splits, custom sampling strategies?
 def get_loader(
-    dataset_path, preprocessing_config, batch_size=1, shuffle=False, num_workers=1
+    dataset_path,
+    preprocessing_config,
+    fold: Optional[int] = None,
+    split: Literal["train", "val", "test"] | None = None,
+    batch_size: int = 1,
+    shuffle: bool = False,
+    num_workers: int = 1,
 ):
     dataset = LongitudinalDataset(
         dataset_path=dataset_path,
         preprocessing_config=preprocessing_config,
         caching_strategy="disk",
     )
+
+    if fold is not None:
+        indices = load_folds(dataset_path, fold=fold, split=split)
+        logger.info(f"Loading {split} split (fold {fold})")
+        dataset = Subset(dataset, indices=indices)
+
     loader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
@@ -360,8 +468,14 @@ if __name__ == "__main__":
     sample = dataset[0]
     assert sample is not None
     assert isinstance(sample, dict)
-    for k, v in sample.items():
-        logger.info(f"Key: {k} -> Value: {(v.shape, v.dtype)}")
+
+    contents = sample["contents"]
+    logger.info(f"case_id -> {sample['case_id']}")
+    logger.info(f"metadata -> {sample['metadata']}")
+    logger.info(f"contents -> {type(contents), len(contents)}")
+    for tp, data in enumerate(contents):
+        logger.info(f"tp {tp} -> scan: {data['scan'].shape, data['scan'].dtype}")
+        logger.info(f"tp {tp} -> mask: {data['mask'].shape, data['mask'].dtype}")
 
     buffer = []
 
@@ -369,24 +483,21 @@ if __name__ == "__main__":
     def test_caching(dataset, idx):
         _ = dataset[idx]
 
-    indices = [0, 0, 0, 1, 1, 1, 2, 3, 2, 3]
-    for idx in indices:
-        test_caching(dataset, idx)
+    generate_folds("inputs", overwrite=True, test_size=0.2, num_folds=3)
 
-    for elapsed, idx in zip(buffer, indices):
-        logger.info(f"Calling {idx} took {elapsed:.4f} seconds!")
+    loader = get_loader(
+        "inputs",
+        {"spacing": (1.0, 1.0, 1.0)},
+        fold=0,
+        split="train",
+        batch_size=1,
+    )
 
-    # logger.info(f"Loaded sample: {sample}")
+    logger.debug(f"Loader size: {len(loader)}")
 
-    # logger.info(f"Sample: {dataset.samples[0]}")
-    # sample = dataset[0]
-    # logger.info(
-    #     f"Sample: {
-    #         {
-    #             k: [(v[i].shape, v[i].dtype) for i in range(len(v))]
-    #             if isinstance(v, list)
-    #             else (v, type(v))
-    #             for k, v in sample.items()
-    #         }
-    #     }"
-    # )
+    # indices = [0, 1, 1]
+    # for idx in indices:
+    #     test_caching(dataset, idx)
+
+    # for elapsed, idx in zip(buffer, indices):
+    #     logger.info(f"Calling {idx} took {elapsed:.4f} seconds!")
