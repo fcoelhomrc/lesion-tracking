@@ -16,7 +16,7 @@ from rich.table import Table
 
 from lesion_tracking.dataset import (
     get_loader,
-    iterate_over_cases_and_timepoints,
+    iterate_over_timepoints,
     without_channel,
 )
 from lesion_tracking.logger import console, get_logger
@@ -165,8 +165,8 @@ def process_datasets(datasets):
 
             for batch in loader:
                 batch_rows = []
-                for tp, (case_id, _, mask) in enumerate(
-                    iterate_over_cases_and_timepoints(batch, include_case_id=True)
+                for tp, (case_id, _, _, mask) in enumerate(
+                    iterate_over_timepoints(batch)
                 ):
                     if case_id in processed_cases:
                         logger.info(f"Skipping already processed case {case_id}")
