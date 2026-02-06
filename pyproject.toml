@@ -19,6 +19,7 @@ dependencies = [
   "connected-components-3d>=3.26.1",
   "einops>=0.8.2",
   "scikit-learn>=1.8.0",
+  "ipython>=9.9.0",
 ]
 
 [[tool.uv.index]]
