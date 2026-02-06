@@ -2,6 +2,7 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterator, Literal, Mapping, Optional, Sequence
@@ -29,9 +30,7 @@ from lesion_tracking.logger import get_logger, track_runtime
 logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
-METADATA_PATTERN = re.compile(r"^metadata\.json$")
 CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
-DATA_PATTERN = re.compile(r"^case_\d{4}_t\d$")  # case_XXXX_tn
 
 
 def load_nifti(path: str | Path):
@@ -57,34 +56,51 @@ def sort_dict_of_lists(d: dict[str, list]) -> dict[str, list]:
 
 
 # TODO: validate NIfTI headers early (e.g., nibabel.load()) to catch corrupted files at startup
-# FIXME: implement an inference mode (both here and in dataset, where masks are not required)
-def scan_dataset_dir(path: str | Path) -> tuple[list, list, dict]:
+def scan_dataset_dir(
+    path: str | Path, allow_missing_masks: bool = False
+) -> tuple[list, list, dict]:
     """
     Scans dataset directory.
     Returns: (flat_items, cases, metadata)
         flat_items: [(case_id, tp, scan_path, mask_path), ...]
         cases: sorted list of case_ids
-        metadata: dict of case metadata
+        metadata: dict of case metadata (case_id -> per-case metadata)
     """
     path = Path(path)
     assert path.exists() and path.is_dir(), f"{path} is invalid."
-    assert (path / "metadata.json").exists(), (
-        "Dataset is missing the metadata.json file"
-    )
 
     flat_items = []
     cases = []
     metadata = {}
 
+    def get_tp_from_filename(s: str) -> int:
+        """
+        Helper that matches foo_bar_t{i}.ext and returns the digit i
+        """
+        match = re.search(r"_t(\d+)\.", Path(s).name)
+        assert match is not None, f"Could not extract timepoint from filename: {s}"
+        return int(match.group(1))
+
+    def pad_missing_tps(scans, masks):
+        """
+        Fills missing timepoints with None.
+        e.g.
+        Scan: [0, 1, 3] -> [0, 1, None, 3]
+        Mask: [0, 2]    -> [0, None, 2, None]
+        """
+        tp_scans = [get_tp_from_filename(s) for s in scans]
+        tp_masks = [get_tp_from_filename(s) for s in masks]
+        tp_max = max(tp_scans + tp_masks)
+        for i in range(0, tp_max + 1):
+            if i not in tp_scans:
+                scans.insert(i, None)
+            if i not in tp_masks:
+                masks.insert(i, None)
+
     for item in path.iterdir():
         if item.is_file():
-            if METADATA_PATTERN.match(item.name):
-                logger.debug(f"Loading metadata from {item}")
-                metadata = json.load(item.open())
-                continue
-            else:
-                logger.debug(f"Ignoring file {str(item)}")
-                continue
+            logger.debug(f"Ignoring file {str(item)}")
+            continue
 
         if item.is_dir() and not CASE_PATTERN.match(item.name):
             logger.debug(f"Skipping {item.name}: does not match CASE_PATTERN")
@@ -92,13 +108,27 @@ def scan_dataset_dir(path: str | Path) -> tuple[list, list, dict]:
 
         case_id = item.name
         cases.append(case_id)
+
+        # Load per-case metadata if exists
+        case_metadata_path = item / "metadata.json"
+        if case_metadata_path.exists():
+            with open(case_metadata_path) as f:
+                metadata[case_id] = json.load(f)
+
         scans = sorted(str(p) for p in (item / "scans").glob("*.nii.gz"))
         masks = sorted(str(p) for p in (item / "masks").glob("*.nii.gz"))
 
-        # FIXME: relax this assumption
-        assert len(scans) == len(masks), (
-            f"{item.name} has mismatched scans/masks: {len(scans)} vs {len(masks)}"
-        )
+        pad_missing_tps(scans, masks)  # Interleaves 'None' where timepoint is missing
+
+        # Missing scans is not allowed
+        assert None not in scans, f"Found missing scan for {case_id}: {scans}"
+
+        # FIXME: relax this assumption for inference mode
+        # Missing masks might be tolerated
+        if not allow_missing_masks:
+            assert len(scans) == len(masks), (
+                f"{item.name} has mismatched scans/masks: {len(scans)} vs {len(masks)}"
+            )
 
         for tp, (scan, mask) in enumerate(zip(scans, masks)):
             flat_items.append((case_id, tp, scan, mask))
@@ -109,6 +139,70 @@ def scan_dataset_dir(path: str | Path) -> tuple[list, list, dict]:
     return flat_items, cases, metadata
 
 
+@dataclass
+class TaskDef:
+    name: str
+    keys: list[str]  # paths into metadata
+    task_type: Literal["classification", "survival"]
+
+
+TASKS = {
+    "crs": TaskDef(
+        name="crs",
+        keys=["treatment.chemotherapy_response_score"],
+        task_type="classification",
+    ),
+    "recist": TaskDef(
+        name="recist",
+        keys=["imaging.RECIST_category"],
+        task_type="classification",
+    ),
+    "survival": TaskDef(
+        name="survival",
+        keys=["outcome.survival_months", "outcome.event"],
+        task_type="survival",
+    ),
+}
+
+
+def get_target(metadata: dict, task: TaskDef) -> dict[str, Any]:
+    result = {}
+    for path in task.keys:
+        keys = path.split(".")
+        value = metadata
+        for key in keys:
+            value = value[key]
+        result[path] = value
+    return result
+
+
+class FeatureGroup(Enum):
+    CLINICAL_BASIC = ["clinical.age", "clinical.ca125_level_at_diagnosis"]
+
+
+def get_features(metadata: dict, groups: list[FeatureGroup]) -> dict[str, Any]:
+    features = {}
+    for group in groups:
+        for path in group.value:
+            keys = path.split(".")
+            value = metadata
+            for key in keys:
+                value = value[key]
+            features[path] = value
+    return features
+
+
+# TODO: Support per-timepoint metadata
+# Main use case: associate real-world time for each scan.
+# e.g. Diagnosis t=0, and then every scan has t given in months relative to diagnosis.
+# Currently, we return a "target" key for every scan,
+# but the targets comer from case-level metadata ("target" values are the same for a given case_id).
+# Hence, longitudinal_collate_fn retains only the first occurence when building "targets".
+# To support per-timepoint metadata, we need to update this logic,
+# e.g. __getitem__ returns "case_metadata" and "tp_metadata",
+#      we abstract this metadata hierarchy with conventient methods to access each level
+#      and collate recontextualizes "case_metadata" as "targets"
+#      while providing additional "medical_time" value obtained from "tp_metadata"
 class LongitudinalDataset(Dataset):
     def __init__(
         self,
@@ -117,29 +211,32 @@ class LongitudinalDataset(Dataset):
             "spacing": (1.0, 1.0, 1.0),
             "normalization": "zscore",
         },
+        task: Optional[str] = None,
+        feature_groups: list[FeatureGroup] | None = None,
         caching_strategy: Literal["ram", "disk"] | None = "disk",
         cache_dir: Optional[str] = None,
     ) -> None:
         super().__init__()
+        self._dataset_path = dataset_path
         self._preprocessing_config = preprocessing_config
+        self._task = TASKS.get(task) if task is not None else None
+        self._feature_groups = feature_groups
         self._caching_strategy = caching_strategy
+        self._cache_dir = cache_dir
 
         self._prepare_full_pipeline()
-        self._prepare_dataset(
-            dataset_path, caching_strategy=caching_strategy, cache_dir=cache_dir
-        )
+        self._prepare_dataset()
 
-    def _prepare_dataset(self, path, caching_strategy, cache_dir):
-        flat_items, cases, metadata = scan_dataset_dir(path)
+    def _prepare_dataset(self):
+        flat_items, cases, metadata = scan_dataset_dir(self._dataset_path)
 
         self._data_dicts: Sequence[dict[str, str]] = [
             {"scan": scan, "mask": mask} for _, _, scan, mask in flat_items
         ]
 
-        if caching_strategy == None:
+        if self._caching_strategy == None:
             raise NotImplementedError("Running without caching is not supported yet.")
-
-        elif caching_strategy == "ram":
+        elif self._caching_strategy == "ram":
             from monai.data import CacheDataset
 
             logger.info("In-memory caching enabled.")
@@ -147,12 +244,12 @@ class LongitudinalDataset(Dataset):
                 data=self._data_dicts,
                 transform=self._full_pipeline,
             )
-        elif caching_strategy == "disk":
+        elif self._caching_strategy == "disk":
             from monai.data import PersistentDataset
             from monai.data.utils import pickle_hashing
 
             # FIXME: relative path depends on CWD; consider requiring absolute path or deriving from dataset_path
-            cache_dir = Path(cache_dir) if cache_dir else Path(".cache")
+            cache_dir = Path(self._cache_dir) if self._cache_dir else Path(".cache")
             cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Disk-based caching enabled. Saving to {str(cache_dir)}")
 
@@ -163,7 +260,7 @@ class LongitudinalDataset(Dataset):
                 hash_transform=pickle_hashing,
             )
         else:
-            raise ValueError(f"Invalid caching strategy: {caching_strategy}")
+            raise ValueError(f"Invalid caching strategy: {self._caching_strategy}")
 
         # FIXME: should use metadata to provide targets
         self._metadata = metadata
@@ -211,11 +308,32 @@ class LongitudinalDataset(Dataset):
         return len(self._flat_items)
 
     def __getitem__(self, idx) -> dict:
+        # FIXME: 'mask' key now holds an optional value
+        # We have relaxed assumption that mask is always present
+        # If mask is null, Monai transforms will break.
+        # We need to omit the mask key from self._flat_items, such that
+        # the Monai transform may silently skip missing keys (allow_missing_keys=True)
+        # instead of raising exception on null value.
+        # Then, after retrieving the transform output, __getitem__ either
+        # i) uses the mask value present
+        # ii) correctly assumes there was no mask available, and includes "mask": None in output dict
+        # Advantages:
+        # i) Keeps __getitem__ output signature static
+        # ii) Keeps compatibility with Monai transforms
+        # iii) Defers handling optional mask to caller
         case_id, tp, global_idx = self._flat_items[idx]
-        data = self._base_dataset[global_idx]
+        data = self._base_dataset[global_idx]  # returns a dict
+
+        target = None
+        if self._task:
+            case_metadata = self._metadata.get(case_id)
+            if case_metadata is not None:
+                target = get_target(case_metadata, self._task)
+
         return {
             "case_id": case_id,
             "tp": tp,
+            "target": target,
             "scan": data["scan"],
             "mask": data["mask"],
         }
@@ -263,13 +381,13 @@ class LongitudinalDataset(Dataset):
                 ]
             )
         elif normalization == "soft_tissue":
-            # Soft tissue window: center=40 HU, width=400 HU -> [-160, 240] HU
+            # Soft tissue window: center=50 HU, width=500 HU -> [-150, 250] HU
             pipeline.extend(
                 [
                     ScaleIntensityRanged(
                         keys=["scan"],
-                        a_min=-160.0,
-                        a_max=240.0,
+                        a_min=-150.0,
+                        a_max=250.0,
                         b_min=0.0,
                         b_max=1.0,
                         clip=True,
@@ -291,7 +409,9 @@ class LongitudinalDataset(Dataset):
             [
                 self._loading_pipeline,
                 ToTensord(keys=["scan", "mask"]),
-                AsDiscreted(keys=["mask"]),
+                AsDiscreted(
+                    keys=["mask"]
+                ),  # FIXME: not working? Masks are f32 instead of i16
                 # self._augmentation_pipeline,
             ],
         ).flatten()
@@ -340,35 +460,40 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
     result = []
     for case_id, items in cases.items():
         items = sorted(items, key=lambda x: x["tp"])
+        # NOTE: Target is per-case, so take from first item (all items have same target)
+        target = items[0]["target"]
         result.append(
             {
                 "case_id": case_id,
+                "target": target,
                 "contents": [
-                    {"scan": item["scan"], "mask": item["mask"]} for item in items
+                    {"scan": item["scan"], "mask": item["mask"], "tp": item["tp"]}
+                    for item in items
                 ],
             }
         )
 
     return {
         "case_ids": [r["case_id"] for r in result],
+        "targets": [r["target"] for r in result],  # per-case targets
         "contents": [r["contents"] for r in result],
     }
 
 
-def iterate_over_cases(batch) -> Iterator[tuple[str, list]]:
+def iterate_over_cases(batch) -> Iterator[tuple[str, Any, list]]:
     batched_case_ids = batch.get("case_ids")
+    batched_targets = batch.get("targets")
     batched_contents = batch.get("contents")
-    for case_id, contents in zip(batched_case_ids, batched_contents):
-        yield case_id, contents
+    for case_id, target, contents in zip(
+        batched_case_ids, batched_targets, batched_contents
+    ):
+        yield case_id, target, contents
 
 
-def iterate_over_cases_and_timepoints(batch, include_case_id=False) -> Iterator[tuple]:
-    for case_id, contents in iterate_over_cases(batch):
+def iterate_over_timepoints(batch) -> Iterator[tuple]:
+    for case_id, target, contents in iterate_over_cases(batch):
         for each in contents:
-            if include_case_id:
-                yield case_id, each["scan"], each["mask"]
-            else:
-                yield each["scan"], each["mask"]
+            yield case_id, target, each["scan"], each["mask"]
 
 
 def without_channel(x: torch.Tensor) -> torch.Tensor:
@@ -473,6 +598,7 @@ def load_folds(
 def get_loader(
     dataset_path,
     preprocessing_config,
+    task: Optional[str] = None,
     fold: Optional[int] = None,
     split: Literal["train", "val", "test"] | None = None,
     cases_per_batch: int = 1,
@@ -482,10 +608,12 @@ def get_loader(
     dataset = LongitudinalDataset(
         dataset_path=dataset_path,
         preprocessing_config=preprocessing_config,
+        task=task,
         caching_strategy="disk",
     )
 
     if fold is not None:
+        assert split is not None
         case_ids = load_folds(dataset_path, fold=fold, split=split)
         logger.info(f"Loading {split} split (fold {fold})")
         dataset.subset_by_cases(case_ids)
@@ -504,7 +632,7 @@ def get_loader(
 
 
 if __name__ == "__main__":
-    dataset = LongitudinalDataset("inputs", caching_strategy="disk")
+    dataset = LongitudinalDataset("inputs/barts", caching_strategy="disk", task="crs")
     logger.info(
         f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
     )
@@ -516,6 +644,7 @@ if __name__ == "__main__":
 
     logger.info(f"case_id -> {sample['case_id']}")
     logger.info(f"tp -> {sample['tp']}")
+    logger.info(f"target -> {sample['target']}")
     logger.info(f"scan -> {sample['scan'].shape, sample['scan'].dtype}")
     logger.info(f"mask -> {sample['mask'].shape, sample['mask'].dtype}")
 
@@ -525,21 +654,20 @@ if __name__ == "__main__":
     def test_caching(dataset, idx):
         _ = dataset[idx]
 
-    generate_folds("inputs", overwrite=True, test_size=0.2, num_folds=3)
+    generate_folds("inputs/barts", overwrite=True, test_size=0.2, num_folds=5)
 
     loader = get_loader(
-        "inputs",
+        "inputs/barts",
         {"spacing": (1.0, 1.0, 1.0), "normalization": "zscore"},
+        task="crs",
         fold=0,
         split="train",
-        cases_per_batch=1,
+        cases_per_batch=2,
     )
 
     logger.debug(f"Loader size: {len(loader)}")
-
-    # indices = [0, 1, 1]
-    # for idx in indices:
-    #     test_caching(dataset, idx)
-
-    # for elapsed, idx in zip(buffer, indices):
-    #     logger.info(f"Calling {idx} took {elapsed:.4f} seconds!")
+    for batch in loader:
+        for case_id, target, scan, mask in iterate_over_timepoints(batch):
+            logger.info(
+                f"{case_id}: {target}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
+            )
