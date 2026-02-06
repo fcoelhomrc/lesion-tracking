@@ -1,9 +1,10 @@
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Iterator, Literal, Mapping, Optional
+from typing import Any, Iterator, Literal, Mapping, Optional, Sequence
 
 import einops
 import numpy as np
@@ -21,12 +22,12 @@ from monai.transforms import (
     Spacingd,
     ToTensord,
 )
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
 from lesion_tracking.logger import get_logger, track_runtime
 
-# Logger level should be configured by the application, not the library
 logger = get_logger(__name__)
+logger.setLevel("DEBUG")
 
 METADATA_PATTERN = re.compile(r"^metadata\.json$")
 CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
@@ -56,11 +57,14 @@ def sort_dict_of_lists(d: dict[str, list]) -> dict[str, list]:
 
 
 # TODO: validate NIfTI headers early (e.g., nibabel.load()) to catch corrupted files at startup
-def scan_dataset_dir(path: str | Path) -> tuple[dict, dict, dict]:
+# FIXME: implement an inference mode (both here and in dataset, where masks are not required)
+def scan_dataset_dir(path: str | Path) -> tuple[list, list, dict]:
     """
-    Scans a dataset directory and returns a list of case entries.
-
-    Returns: [{ case_id: str, scans: [...], masks: [...] }, ...]
+    Scans dataset directory.
+    Returns: (flat_items, cases, metadata)
+        flat_items: [(case_id, tp, scan_path, mask_path), ...]
+        cases: sorted list of case_ids
+        metadata: dict of case metadata
     """
     path = Path(path)
     assert path.exists() and path.is_dir(), f"{path} is invalid."
@@ -68,32 +72,26 @@ def scan_dataset_dir(path: str | Path) -> tuple[dict, dict, dict]:
         "Dataset is missing the metadata.json file"
     )
 
-    # # Get tp Y from case X
-    # map_idx.get(map_case.get(X).get(Y))
-    # # Get all tps from case X
-    # map_idx.get(map_case.get(X))
-
-    # Flat dict: index -> {scan: (file path), mask: (file path)}
-    map_idx_to_data = {}
-
-    # Structural dict: case_id -> {tp: index}
-    map_case_to_tp = {}
-
-    # Metadata dict: case_id -> {metadata}
+    flat_items = []
+    cases = []
     metadata = {}
 
-    counter = 0
     for item in path.iterdir():
-        if item.is_file() and METADATA_PATTERN.match(item.name):
-            logger.debug(f"Loading metadata from {item}")
-            metadata = json.load(item.open())
-            continue
+        if item.is_file():
+            if METADATA_PATTERN.match(item.name):
+                logger.debug(f"Loading metadata from {item}")
+                metadata = json.load(item.open())
+                continue
+            else:
+                logger.debug(f"Ignoring file {str(item)}")
+                continue
 
         if item.is_dir() and not CASE_PATTERN.match(item.name):
             logger.debug(f"Skipping {item.name}: does not match CASE_PATTERN")
             continue
 
         case_id = item.name
+        cases.append(case_id)
         scans = sorted(str(p) for p in (item / "scans").glob("*.nii.gz"))
         masks = sorted(str(p) for p in (item / "masks").glob("*.nii.gz"))
 
@@ -102,29 +100,13 @@ def scan_dataset_dir(path: str | Path) -> tuple[dict, dict, dict]:
             f"{item.name} has mismatched scans/masks: {len(scans)} vs {len(masks)}"
         )
 
-        tps = {}
         for tp, (scan, mask) in enumerate(zip(scans, masks)):
-            map_idx_to_data[counter] = {
-                "scan": scan,
-                "mask": mask,
-            }
-            tps[tp] = counter
-            counter += 1
-        map_case_to_tp[case_id] = tps
+            flat_items.append((case_id, tp, scan, mask))
 
-    return map_idx_to_data, map_case_to_tp, metadata
+    cases = sorted(cases)
+    flat_items = sorted(flat_items, key=lambda x: (x[0], x[1]))
 
-
-class BaseDataset(Dataset):
-    def __init__(self, data: dict[int, dict]) -> None:
-        super().__init__()
-        self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
+    return flat_items, cases, metadata
 
 
 class LongitudinalDataset(Dataset):
@@ -148,24 +130,21 @@ class LongitudinalDataset(Dataset):
         )
 
     def _prepare_dataset(self, path, caching_strategy, cache_dir):
-        map_idx_to_data, map_case_to_tp, metadata = scan_dataset_dir(path)
-        cases = sorted(case for case in map_case_to_tp)
+        flat_items, cases, metadata = scan_dataset_dir(path)
+
+        self._data_dicts: Sequence[dict[str, str]] = [
+            {"scan": scan, "mask": mask} for _, _, scan, mask in flat_items
+        ]
 
         if caching_strategy == None:
-            # FIXME: needs to handle all transforms
-            # self._base_dataset = BaseDataset(data=map_idx_to_data)
-            raise NotImplementedError(
-                "BaseDataset is not able to handle transforms yet."
-            )
+            raise NotImplementedError("Running without caching is not supported yet.")
+
         elif caching_strategy == "ram":
             from monai.data import CacheDataset
 
-            logger.info("Caching enabled!")
-
+            logger.info("In-memory caching enabled.")
             self._base_dataset = CacheDataset(
-                data=[
-                    map_idx_to_data[i] for i in range(len(map_idx_to_data))
-                ],  # Guarantees ordering
+                data=self._data_dicts,
                 transform=self._full_pipeline,
             )
         elif caching_strategy == "disk":
@@ -175,24 +154,27 @@ class LongitudinalDataset(Dataset):
             # FIXME: relative path depends on CWD; consider requiring absolute path or deriving from dataset_path
             cache_dir = Path(cache_dir) if cache_dir else Path(".cache")
             cache_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Persistent caching enabled! Saving to {str(cache_dir)}")
+            logger.info(f"Disk-based caching enabled. Saving to {str(cache_dir)}")
 
             self._base_dataset = PersistentDataset(
-                data=[
-                    map_idx_to_data[i] for i in range(len(map_idx_to_data))
-                ],  # Guarantees ordering
+                data=self._data_dicts,
                 transform=self._full_pipeline,
                 cache_dir=cache_dir,
                 hash_transform=pickle_hashing,
             )
-
         else:
             raise ValueError(f"Invalid caching strategy: {caching_strategy}")
 
-        self._map_idx_to_data = map_idx_to_data
-        self._map_case_to_tp = map_case_to_tp
+        # FIXME: should use metadata to provide targets
         self._metadata = metadata
         self._cases = cases
+        self._flat_items = [
+            (case_id, tp, idx) for idx, (case_id, tp, _, _) in enumerate(flat_items)
+        ]
+
+        self._case_to_flat_indices = defaultdict(list)
+        for flat_idx, (case_id, _, _) in enumerate(self._flat_items):
+            self._case_to_flat_indices[case_id].append(flat_idx)
 
     def num_scans(self) -> int:
         return len(self._base_dataset)
@@ -200,44 +182,43 @@ class LongitudinalDataset(Dataset):
     def num_cases(self) -> int:
         return len(self._cases)
 
-    def _get_tps_for_case(self, case_id: str):
-        tp = self._map_case_to_tp.get(case_id)
-        if tp is None:
-            raise ValueError(f"Invalid case_id: {case_id}")
-        return tp
+    def get_case_indices(self, case_id: str) -> list[int]:
+        return self._case_to_flat_indices[case_id]
 
-    def _iterate_tps_for_case(self, case_id: str):
-        tps = self._get_tps_for_case(case_id)
-        for tp in range(len(tps)):  # Guarantees ordered iteration
-            idx = tps.get(tp)  # Global index for this particular (case, tp)
-            yield idx
+    @property
+    def case_ids(self) -> list[str]:
+        return self._cases
+
+    def subset_by_cases(self, case_ids: list[str]) -> "LongitudinalDataset":
+        """
+        Filters accessible cases by mutating internal mappings.
+        Global indices are preserved, since the base dataset is unchanged.
+        This is necessary because torch.utils.data.Subset does not expose the API used by our custom sampler.
+        """
+        selected_cases = set(case_ids)
+        self._flat_items = [
+            (case_id, tp, global_idx)
+            for case_id, tp, global_idx in self._flat_items
+            if case_id in selected_cases
+        ]
+        self._cases = [c for c in self._cases if c in selected_cases]
+        self._case_to_flat_indices = defaultdict(list)
+        for flat_idx, (case_id, _, _) in enumerate(self._flat_items):
+            self._case_to_flat_indices[case_id].append(flat_idx)
+        return self
 
     def __len__(self) -> int:
-        return self.num_cases()
+        return len(self._flat_items)
 
     def __getitem__(self, idx) -> dict:
-        """
-        Output: dict
-        Keys:
-            case_id - patient identifier
-            metadata - dict with all available metadata
-            contents - list with items {scan, mask}, ordered in time
-        Batch (needs longitudinal_collate_fn):
-            metadata - list of 'metadata' dicts
-            contents - list of 'contents' lists
-        """
-        # FIXME: metadata already contains case_id key, either remove redundancy or use it for sanity check
-        # FIXME: need to handle "targets" better - perhaps trim down metadata?
-        case_id = self._cases[idx]
-        item = {
+        case_id, tp, global_idx = self._flat_items[idx]
+        data = self._base_dataset[global_idx]
+        return {
             "case_id": case_id,
-            "metadata": self._metadata.get(case_id),
-            "contents": [],
+            "tp": tp,
+            "scan": data["scan"],
+            "mask": data["mask"],
         }
-        for idx in self._iterate_tps_for_case(case_id=case_id):
-            # Handles all transforms (load, preprocessing, augmentation)
-            item["contents"].append(self._base_dataset[idx])
-        return item
 
     def _prepare_loader(self):
         """
@@ -295,9 +276,12 @@ class LongitudinalDataset(Dataset):
                     ),
                 ]
             )
+        else:
+            raise ValueError(f"Invalid normalization: {normalization}")
 
         self._loading_pipeline = Compose(pipeline)
 
+    # TODO: implement data augmentation transforms (deterministic should come before random transforms!)
     def _prepare_augmentations(self): ...
 
     def _prepare_full_pipeline(self):
@@ -314,40 +298,77 @@ class LongitudinalDataset(Dataset):
 
     def refresh_cache(self):
         if self._caching_strategy is not None:
-            self._base_dataset.set_data(
-                [self._map_idx_to_data[i] for i in range(len(self._map_idx_to_data))]
-            )
+            self._base_dataset.set_data(self._data_dicts)
 
 
-def longitudinal_collate_fn(batch):
-    """Custom collate that handles variable-length sequences."""
+class CaseGroupedBatchSampler(Sampler):
+    def __init__(
+        self,
+        dataset: LongitudinalDataset,
+        cases_per_batch: int = 1,
+        shuffle: bool = True,
+    ):
+        self.dataset = dataset
+        self.cases_per_batch = cases_per_batch
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        import random
+
+        case_ids = list(self.dataset.case_ids)
+        if self.shuffle:
+            random.shuffle(case_ids)
+
+        for i in range(0, len(case_ids), self.cases_per_batch):
+            batch_cases = case_ids[i : i + self.cases_per_batch]
+            batch_indices = []
+            for case_id in batch_cases:
+                batch_indices.extend(self.dataset.get_case_indices(case_id))
+            yield batch_indices
+
+    def __len__(self):
+        return (
+            len(self.dataset.case_ids) + self.cases_per_batch - 1
+        ) // self.cases_per_batch
+
+
+def longitudinal_collate_fn(batch: list[dict]) -> dict:
+    cases = defaultdict(list)
+    for item in batch:
+        cases[item["case_id"]].append(item)
+
+    result = []
+    for case_id, items in cases.items():
+        items = sorted(items, key=lambda x: x["tp"])
+        result.append(
+            {
+                "case_id": case_id,
+                "contents": [
+                    {"scan": item["scan"], "mask": item["mask"]} for item in items
+                ],
+            }
+        )
+
     return {
-        "case_id": [item.get("case_id") for item in batch],
-        "metadata": [item.get("metadata") for item in batch],
-        "contents": [item["contents"] for item in batch],
+        "case_ids": [r["case_id"] for r in result],
+        "contents": [r["contents"] for r in result],
     }
 
 
-def iterate_over_cases(batch) -> Iterator[tuple[str, dict]]:
-    """
-    Iterator yields the packed sequence for each case in batch
-    """
-    batched_case_ids = batch.get("case_id")
+def iterate_over_cases(batch) -> Iterator[tuple[str, list]]:
+    batched_case_ids = batch.get("case_ids")
     batched_contents = batch.get("contents")
     for case_id, contents in zip(batched_case_ids, batched_contents):
         yield case_id, contents
 
 
 def iterate_over_cases_and_timepoints(batch, include_case_id=False) -> Iterator[tuple]:
-    """
-    Iterator yields the unpacked sequence from each (case, timepoint) in batch
-    """
     for case_id, contents in iterate_over_cases(batch):
         for each in contents:
             if include_case_id:
-                yield case_id, each.get("scan"), each.get("mask")
+                yield case_id, each["scan"], each["mask"]
             else:
-                yield each.get("scan"), each.get("mask")
+                yield each["scan"], each["mask"]
 
 
 def without_channel(x: torch.Tensor) -> torch.Tensor:
@@ -385,8 +406,8 @@ def generate_folds(
     if stratified:
         assert stratification_key is not None, "Missing stratification key"
 
-    _, map_case_to_tp, metadata = scan_dataset_dir(dataset_path)
-    num_cases = len(map_case_to_tp)
+    _, cases, metadata = scan_dataset_dir(dataset_path)
+    num_cases = len(cases)
     results = {
         "stratified": stratified,
         "stratification_key": stratification_key,
@@ -424,20 +445,20 @@ def generate_folds(
             # Keep indexing consistent
             train_indices = np.asarray(train_val_indices)[train_indices].tolist()
             val_indices = np.asarray(train_val_indices)[val_indices].tolist()
-            # Store results
-            results[i] = {
-                "train": train_indices,
-                "val": val_indices,
-                "test": test_indices,
+            # Store fold in a human-readable format
+            results[str(i)] = {
+                "train": [cases[j] for j in train_indices],
+                "val": [cases[j] for j in val_indices],
+                "test": [cases[j] for j in test_indices],
             }
 
-    json.dump(results, folds_json.open("w"))
+    json.dump(results, folds_json.open("w"), indent=2)
     return
 
 
 def load_folds(
     dataset_path: str | Path, fold: int, split: Literal["train", "val", "test"]
-) -> list[int]:
+) -> list[str]:
     folds_json = Path(dataset_path) / "folds.json"
     folds = json.load(folds_json.open())
     train_val_test: dict | None = folds.get(str(fold))
@@ -449,13 +470,12 @@ def load_folds(
     return train_val_test[split]
 
 
-# TODO: add splits, custom sampling strategies?
 def get_loader(
     dataset_path,
     preprocessing_config,
     fold: Optional[int] = None,
     split: Literal["train", "val", "test"] | None = None,
-    batch_size: int = 1,
+    cases_per_batch: int = 1,
     shuffle: bool = False,
     num_workers: int = 1,
 ):
@@ -466,14 +486,17 @@ def get_loader(
     )
 
     if fold is not None:
-        indices = load_folds(dataset_path, fold=fold, split=split)
+        case_ids = load_folds(dataset_path, fold=fold, split=split)
         logger.info(f"Loading {split} split (fold {fold})")
-        dataset = Subset(dataset, indices=indices)
+        dataset.subset_by_cases(case_ids)
+
+    batch_sampler = CaseGroupedBatchSampler(
+        dataset, cases_per_batch=cases_per_batch, shuffle=shuffle
+    )
 
     loader = DataLoader(
         dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
+        batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=longitudinal_collate_fn,
     )
@@ -482,25 +505,19 @@ def get_loader(
 
 if __name__ == "__main__":
     dataset = LongitudinalDataset("inputs", caching_strategy="disk")
-
     logger.info(
-        f"Created dataset with {len(dataset)} cases ({dataset.num_scans()} scans)"
+        f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
     )
-    logger.info(f"Global map: {dataset._map_idx_to_data}")
-    logger.info(f"Structure: {dataset._map_case_to_tp}")
     logger.info(f"Cases: {dataset._cases}")
 
     sample = dataset[0]
     assert sample is not None
     assert isinstance(sample, dict)
 
-    contents = sample["contents"]
     logger.info(f"case_id -> {sample['case_id']}")
-    logger.info(f"metadata -> {sample['metadata']}")
-    logger.info(f"contents -> {type(contents), len(contents)}")
-    for tp, data in enumerate(contents):
-        logger.info(f"tp {tp} -> scan: {data['scan'].shape, data['scan'].dtype}")
-        logger.info(f"tp {tp} -> mask: {data['mask'].shape, data['mask'].dtype}")
+    logger.info(f"tp -> {sample['tp']}")
+    logger.info(f"scan -> {sample['scan'].shape, sample['scan'].dtype}")
+    logger.info(f"mask -> {sample['mask'].shape, sample['mask'].dtype}")
 
     buffer = []
 
@@ -512,10 +529,10 @@ if __name__ == "__main__":
 
     loader = get_loader(
         "inputs",
-        {"spacing": (1.0, 1.0, 1.0)},
+        {"spacing": (1.0, 1.0, 1.0), "normalization": "zscore"},
         fold=0,
         split="train",
-        batch_size=1,
+        cases_per_batch=1,
     )
 
     logger.debug(f"Loader size: {len(loader)}")
