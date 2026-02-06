@@ -158,7 +158,9 @@ def process_datasets(datasets):
             processed_cases = get_processed_cases(OUTPUT_CSV, name)
             logger.info(f"Already processed {len(processed_cases)} cases for {name}")
 
-            loader = get_loader(path, {"spacing": SPACING}, batch_size=1, num_workers=0)
+            loader = get_loader(
+                path, {"spacing": SPACING}, cases_per_batch=1, num_workers=0
+            )
             batch_task = progress.add_task(f"[green]{name} batches", total=len(loader))
 
             for batch in loader:

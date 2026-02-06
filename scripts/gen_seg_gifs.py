@@ -13,7 +13,7 @@ from skimage import measure
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from lesion_tracking.dataset import LongitudinalDataset, without_channel
+from lesion_tracking.dataset import get_loader, iterate_over_cases, without_channel
 
 # Consistent color palette for semantic labels (up to 22 labels)
 # Labels 1 and 9 are most important: RED and BLUE respectively
@@ -370,41 +370,38 @@ def main() -> None:
     outputs_dir = Path(__file__).parent.parent / "outputs" / "seg_gifs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load dataset (handles resampling, orientation, etc.)
     print("Loading dataset...")
-    dataset = LongitudinalDataset(
+    loader = get_loader(
         dataset_path=dataset_path,
         preprocessing_config={
             "spacing": (1.0, 1.0, 1.0),
             "normalization": "soft_tissue",
         },
-        caching_strategy="disk",
-        cache_dir=str(Path(__file__).parent.parent / ".cache"),
+        cases_per_batch=1,
+        shuffle=False,
+        num_workers=0,
     )
 
-    print(f"Found {len(dataset)} cases ({dataset.num_scans()} scans)")
+    print(f"Found {len(loader)} cases")
 
-    for idx in range(len(dataset)):
-        sample = dataset[idx]
-        case_id = sample["case_id"]
-        contents = sample["contents"]
+    for batch in loader:
+        for case_id, contents in iterate_over_cases(batch):
+            print(f"\nProcessing {case_id}...")
+            output_path = outputs_dir / f"{case_id}_seg.gif"
 
-        print(f"\nProcessing {case_id}...")
-        output_path = outputs_dir / f"{case_id}_seg.gif"
+            try:
+                generate_gif_for_case(
+                    case_id=case_id,
+                    contents=contents,
+                    output_path=output_path,
+                    fps=8,
+                    skip_empty=False,
+                )
+            except Exception as e:
+                print(f"  Error processing {case_id}: {e}")
+                import traceback
 
-        try:
-            generate_gif_for_case(
-                case_id=case_id,
-                contents=contents,
-                output_path=output_path,
-                fps=8,
-                skip_empty=False,
-            )
-        except Exception as e:
-            print(f"  Error processing {case_id}: {e}")
-            import traceback
-
-            traceback.print_exc()
+                traceback.print_exc()
 
     print(f"\nDone! GIFs saved to {outputs_dir}")
 
