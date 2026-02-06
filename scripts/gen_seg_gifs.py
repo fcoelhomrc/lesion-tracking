@@ -288,13 +288,20 @@ def generate_gif_for_case(
 
     print(f"  Pre shape: {ct_pre.shape}, Post shape: {ct_post.shape}")
 
-    # Normalize for display - use p1/p99 for full dynamic range
+    # Soft tissue window: center=40 HU, width=400 HU -> range [-160, 240] HU
     def normalize_for_display(data: np.ndarray) -> np.ndarray:
-        """Normalize z-scored data to [0,1] with good contrast."""
-        p1, p99 = np.percentile(data, [1, 99])
-        np.clip(data, p1, p99, out=data)
-        data -= p1
-        data /= p99 - p1 + 1e-8
+        """
+        No-op. Instead the normalization is a setting of the dataset instance
+        """
+        # """Apply soft tissue windowing and normalize to [0,1]."""
+        # print(f"Data: min {data.min()} max {data.max()} dtype {data.dtype}")
+        # window_center = 40
+        # window_width = 400
+        # low = window_center - window_width / 2  # -160
+        # high = window_center + window_width / 2  # 240
+        # np.clip(data, low, high, out=data)
+        # data -= low
+        # data /= window_width
         return data
 
     ct_pre = normalize_for_display(ct_pre.astype(np.float32))
@@ -367,6 +374,10 @@ def main() -> None:
     print("Loading dataset...")
     dataset = LongitudinalDataset(
         dataset_path=dataset_path,
+        preprocessing_config={
+            "spacing": (1.0, 1.0, 1.0),
+            "normalization": "soft_tissue",
+        },
         caching_strategy="disk",
         cache_dir=str(Path(__file__).parent.parent / ".cache"),
     )
