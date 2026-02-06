@@ -9,26 +9,24 @@ import einops
 import numpy as np
 import pandas as pd
 import torch
-from monai.data import MetaTensor
-from monai.data.image_reader import ImageReader, NibabelReader
+from monai.data.image_reader import NibabelReader
 from monai.transforms import (
     AsDiscreted,
     Compose,
     EnsureChannelFirstd,
     LoadImaged,
-    MapTransform,
     NormalizeIntensityd,
     Orientationd,
+    ScaleIntensityRanged,
     Spacingd,
     ToTensord,
 )
-from numpy.typing import NDArray
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from lesion_tracking.logger import get_logger, track_runtime
 
+# Logger level should be configured by the application, not the library
 logger = get_logger(__name__)
-logger.setLevel("DEBUG")
 
 METADATA_PATTERN = re.compile(r"^metadata\.json$")
 CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
@@ -57,6 +55,7 @@ def sort_dict_of_lists(d: dict[str, list]) -> dict[str, list]:
     return d_sorted
 
 
+# TODO: validate NIfTI headers early (e.g., nibabel.load()) to catch corrupted files at startup
 def scan_dataset_dir(path: str | Path) -> tuple[dict, dict, dict]:
     """
     Scans a dataset directory and returns a list of case entries.
@@ -132,7 +131,10 @@ class LongitudinalDataset(Dataset):
     def __init__(
         self,
         dataset_path: str | Path,
-        preprocessing_config: dict = {"spacing": (1.0, 1.0, 1.0)},
+        preprocessing_config: dict = {
+            "spacing": (1.0, 1.0, 1.0),
+            "normalization": "zscore",
+        },
         caching_strategy: Literal["ram", "disk"] | None = "disk",
         cache_dir: Optional[str] = None,
     ) -> None:
@@ -170,6 +172,7 @@ class LongitudinalDataset(Dataset):
             from monai.data import PersistentDataset
             from monai.data.utils import pickle_hashing
 
+            # FIXME: relative path depends on CWD; consider requiring absolute path or deriving from dataset_path
             cache_dir = Path(cache_dir) if cache_dir else Path(".cache")
             cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Persistent caching enabled! Saving to {str(cache_dir)}")
@@ -243,35 +246,57 @@ class LongitudinalDataset(Dataset):
             1. Read image from disk
             2. Reorient to RAS
             3. Resample to unit volume
-            4. Normalize with z-score method
+            4. Normalize
 
         The API handles differences in preprocessing steps between volumes and segmentation masks,
         while automatically updating the affine matrix.
         """
-        self._loading_pipeline = Compose(
-            [
-                LoadImaged(
-                    keys=["scan", "mask"],
-                    reader="NibabelReader",
-                    as_closest_canonical=True,
-                    squeeze_non_spatial_dims=True,
-                ),
-                EnsureChannelFirstd(keys=["scan", "mask"]),
-                # Reorienting
-                Orientationd(keys=["scan", "mask"], axcodes="RAS", labels=None),
-                # Resampling
-                Spacingd(
-                    keys=["scan", "mask"],
-                    pixdim=self._preprocessing_config["spacing"],
-                    mode=("bilinear", "nearest"),
-                ),
-                # Z-score normalization
-                NormalizeIntensityd(
-                    keys=["scan"],
-                    channel_wise=True,
-                ),
-            ],
-        )
+
+        pipeline = [
+            LoadImaged(
+                keys=["scan", "mask"],
+                reader="NibabelReader",
+                as_closest_canonical=True,
+                squeeze_non_spatial_dims=False,
+            ),
+            EnsureChannelFirstd(keys=["scan", "mask"]),
+            # Reorienting
+            Orientationd(keys=["scan", "mask"], axcodes="RAS", labels=None),
+            # Resampling
+            Spacingd(
+                keys=["scan", "mask"],
+                pixdim=self._preprocessing_config["spacing"],
+                mode=("bilinear", "nearest"),
+            ),
+        ]
+
+        normalization = self._preprocessing_config.get("normalization")
+        if normalization == "zscore":
+            # Z-score normalization
+            pipeline.extend(
+                [
+                    NormalizeIntensityd(
+                        keys=["scan"],
+                        channel_wise=True,
+                    ),
+                ]
+            )
+        elif normalization == "soft_tissue":
+            # Soft tissue window: center=40 HU, width=400 HU -> [-160, 240] HU
+            pipeline.extend(
+                [
+                    ScaleIntensityRanged(
+                        keys=["scan"],
+                        a_min=-160.0,
+                        a_max=240.0,
+                        b_min=0.0,
+                        b_max=1.0,
+                        clip=True,
+                    ),
+                ]
+            )
+
+        self._loading_pipeline = Compose(pipeline)
 
     def _prepare_augmentations(self): ...
 
@@ -346,7 +371,6 @@ def generate_folds(
     import json
 
     from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
-    from torch.utils.data import Subset
 
     folds_json = Path(dataset_path) / "folds.json"
     if folds_json.exists() and not overwrite:
@@ -361,7 +385,8 @@ def generate_folds(
     if stratified:
         assert stratification_key is not None, "Missing stratification key"
 
-    dataset = LongitudinalDataset(dataset_path=dataset_path)
+    _, map_case_to_tp, metadata = scan_dataset_dir(dataset_path)
+    num_cases = len(map_case_to_tp)
     results = {
         "stratified": stratified,
         "stratification_key": stratification_key,
@@ -370,7 +395,7 @@ def generate_folds(
     if stratified:
         # TODO: finish implementation.
         # Need to work on metadata/targets on dataset implementation.
-        indices = [i for i in range(len(dataset))]
+        indices = list(range(num_cases))
         targets = []
 
         train_val_indices, test_indices, train_val_targets, test_targets = (
@@ -384,7 +409,7 @@ def generate_folds(
             pass
 
     else:
-        indices = [i for i in range(len(dataset))]
+        indices = list(range(num_cases))
 
         # Generate held-out test set
         train_val_indices, test_indices = train_test_split(
