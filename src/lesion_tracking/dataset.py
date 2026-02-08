@@ -131,7 +131,6 @@ def scan_dataset_dir(
         # Missing scans is not allowed
         assert None not in scans, f"Found missing scan for {case_id}: {scans}"
 
-        # FIXME: relax this assumption for inference mode
         # Missing masks might be tolerated
         if not allow_missing_masks:
             assert len(scans) == len(masks), (
@@ -464,7 +463,6 @@ class LongitudinalDataset(Dataset):
 
         self._loading_pipeline = Compose(pipeline)
 
-    # TODO: implement data augmentation transforms (deterministic should come before random transforms!)
     def _prepare_augmentations(self):
         spatial_keys = ["scan", "mask"]
         self._augmentation_pipeline = Compose(
@@ -695,8 +693,6 @@ def generate_folds(
     if stratified:
         assert stratification_key is not None, "Stratification key was not provided."
 
-        # TODO: finish implementation.
-        # Need to work on metadata/targets on dataset implementation.
         case_metadata = [metadata.get(case) for case in cases]
 
         # Keep only cases that provide the specified stratification key
