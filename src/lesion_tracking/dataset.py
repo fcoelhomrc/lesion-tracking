@@ -12,23 +12,29 @@ import numpy as np
 import pandas as pd
 import torch
 from monai.data.image_reader import NibabelReader
-from monai.transforms import (
-    CastToTyped,
-    Compose,
-    EnsureChannelFirstd,
-    LoadImaged,
+from monai.transforms.compose import Compose
+from monai.transforms.intensity.dictionary import (
     NormalizeIntensityd,
-    Orientationd,
-    Rand3DElasticd,
     RandAdjustContrastd,
-    RandAffined,
     RandGaussianNoised,
     RandGaussianSmoothd,
-    RandRotated,
     RandScaleIntensityd,
-    RandZoomd,
     ScaleIntensityRanged,
+)
+from monai.transforms.io.dictionary import (
+    LoadImaged,
+)
+from monai.transforms.spatial.dictionary import (
+    Orientationd,
+    Rand3DElasticd,
+    RandAffined,
+    RandRotated,
+    RandZoomd,
     Spacingd,
+)
+from monai.transforms.utility.dictionary import (
+    CastToTyped,
+    EnsureChannelFirstd,
     ToTensord,
 )
 from torch.utils.data import DataLoader, Dataset, Sampler, Subset
@@ -184,11 +190,18 @@ def parse_metadata(
     """
     # Normalize: flatten FeatureGroups into plain strings
     if paths and isinstance(paths[0], FeatureGroup):
-        paths = [p for g in paths for p in g.value]
+        temp = []
+        for group in paths:
+            assert isinstance(group, FeatureGroup)
+            for path in group.value:
+                assert isinstance(path, str)
+                temp.append(path)
+        paths = temp
 
     result = {}
     # Parses nested dicts obtained from metadata json
     for path in paths:
+        assert isinstance(path, str)
         keys = path.split(".")  # Use dot notation to represent nested keys
         value = metadata
         for key in keys:
@@ -277,7 +290,7 @@ class LongitudinalDataset(Dataset):
         if self._caching_strategy == None:
             raise NotImplementedError("Running without caching is not supported yet.")
         elif self._caching_strategy == "ram":
-            from monai.data import CacheDataset
+            from monai.data.dataset import CacheDataset
 
             logger.info("In-memory caching enabled.")
             self._base_dataset = CacheDataset(
@@ -285,7 +298,7 @@ class LongitudinalDataset(Dataset):
                 transform=self._full_pipeline,
             )
         elif self._caching_strategy == "disk":
-            from monai.data import PersistentDataset
+            from monai.data.dataset import PersistentDataset
             from monai.data.utils import pickle_hashing
 
             cache_dir = (
