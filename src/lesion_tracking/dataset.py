@@ -230,8 +230,10 @@ class LongitudinalDataset(Dataset):
     def _prepare_dataset(self):
         flat_items, cases, metadata = scan_dataset_dir(self._dataset_path)
 
+        # This attribute is static and should not change after class is instantiated.
         self._data_dicts: Sequence[dict[str, str]] = [
-            {"scan": scan, "mask": mask} for _, _, scan, mask in flat_items
+            {"scan": scan, "mask": mask} if mask is not None else {"scan": scan}
+            for _, _, scan, mask in flat_items
         ]
 
         if self._caching_strategy == None:
@@ -308,10 +310,10 @@ class LongitudinalDataset(Dataset):
         return len(self._flat_items)
 
     def __getitem__(self, idx) -> dict:
-        # FIXME: 'mask' key now holds an optional value
+        # NOTE: 'mask' key now holds an optional value
         # We have relaxed assumption that mask is always present
         # If mask is null, Monai transforms will break.
-        # We need to omit the mask key from self._flat_items, such that
+        # We need to omit the mask key from self._data_dicts, such that
         # the Monai transform may silently skip missing keys (allow_missing_keys=True)
         # instead of raising exception on null value.
         # Then, after retrieving the transform output, __getitem__ either
@@ -323,6 +325,9 @@ class LongitudinalDataset(Dataset):
         # iii) Defers handling optional mask to caller
         case_id, tp, global_idx = self._flat_items[idx]
         data = self._base_dataset[global_idx]  # returns a dict
+        assert isinstance(data, Mapping), (
+            f"Expected base dataset to return a mapping, got {type(data)} instead"
+        )
 
         target = None
         if self._task:
@@ -335,7 +340,7 @@ class LongitudinalDataset(Dataset):
             "tp": tp,
             "target": target,
             "scan": data["scan"],
-            "mask": data["mask"],
+            "mask": data.get("mask"),
         }
 
     def _prepare_loader(self):
@@ -357,15 +362,25 @@ class LongitudinalDataset(Dataset):
                 reader="NibabelReader",
                 as_closest_canonical=True,
                 squeeze_non_spatial_dims=False,
+                allow_missing_keys=True,
             ),
-            EnsureChannelFirstd(keys=["scan", "mask"]),
+            EnsureChannelFirstd(
+                keys=["scan", "mask"],
+                allow_missing_keys=True,
+            ),
             # Reorienting
-            Orientationd(keys=["scan", "mask"], axcodes="RAS", labels=None),
+            Orientationd(
+                keys=["scan", "mask"],
+                axcodes="RAS",
+                labels=None,
+                allow_missing_keys=True,
+            ),
             # Resampling
             Spacingd(
                 keys=["scan", "mask"],
                 pixdim=self._preprocessing_config["spacing"],
                 mode=("bilinear", "nearest"),
+                allow_missing_keys=True,
             ),
         ]
 
@@ -377,6 +392,7 @@ class LongitudinalDataset(Dataset):
                     NormalizeIntensityd(
                         keys=["scan"],
                         channel_wise=True,
+                        allow_missing_keys=True,
                     ),
                 ]
             )
@@ -391,6 +407,7 @@ class LongitudinalDataset(Dataset):
                         b_min=0.0,
                         b_max=1.0,
                         clip=True,
+                        allow_missing_keys=True,
                     ),
                 ]
             )
@@ -408,15 +425,22 @@ class LongitudinalDataset(Dataset):
         self._full_pipeline = Compose(
             [
                 self._loading_pipeline,
-                ToTensord(keys=["scan", "mask"]),
+                ToTensord(
+                    keys=["scan", "mask"],
+                    allow_missing_keys=True,
+                ),
                 AsDiscreted(
-                    keys=["mask"]
+                    keys=["mask"],
+                    allow_missing_keys=True,
                 ),  # FIXME: not working? Masks are f32 instead of i16
                 # self._augmentation_pipeline,
             ],
         ).flatten()
 
     def refresh_cache(self):
+        """
+        Invalidates the whole cache.
+        """
         if self._caching_strategy is not None:
             self._base_dataset.set_data(self._data_dicts)
 
@@ -467,7 +491,7 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
                 "case_id": case_id,
                 "target": target,
                 "contents": [
-                    {"scan": item["scan"], "mask": item["mask"], "tp": item["tp"]}
+                    {"scan": item["scan"], "mask": item.get("mask"), "tp": item["tp"]}
                     for item in items
                 ],
             }
@@ -632,7 +656,8 @@ def get_loader(
 
 
 if __name__ == "__main__":
-    dataset = LongitudinalDataset("inputs/barts", caching_strategy="disk", task="crs")
+    dataset_path = "inputs/dummy"
+    dataset = LongitudinalDataset(dataset_path, caching_strategy="disk", task="crs")
     logger.info(
         f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
     )
@@ -646,7 +671,10 @@ if __name__ == "__main__":
     logger.info(f"tp -> {sample['tp']}")
     logger.info(f"target -> {sample['target']}")
     logger.info(f"scan -> {sample['scan'].shape, sample['scan'].dtype}")
-    logger.info(f"mask -> {sample['mask'].shape, sample['mask'].dtype}")
+    if sample.get("mask") is not None:
+        logger.info(f"mask -> {sample['mask'].shape, sample['mask'].dtype}")
+    else:
+        logger.info("mask -> not available")
 
     buffer = []
 
@@ -654,13 +682,13 @@ if __name__ == "__main__":
     def test_caching(dataset, idx):
         _ = dataset[idx]
 
-    generate_folds("inputs/barts", overwrite=True, test_size=0.2, num_folds=5)
+    generate_folds(dataset_path, overwrite=True, test_size=0.2, num_folds=2)
 
     loader = get_loader(
-        "inputs/barts",
+        dataset_path,
         {"spacing": (1.0, 1.0, 1.0), "normalization": "zscore"},
         task="crs",
-        fold=0,
+        fold=1,
         split="train",
         cases_per_batch=2,
     )
@@ -668,6 +696,11 @@ if __name__ == "__main__":
     logger.debug(f"Loader size: {len(loader)}")
     for batch in loader:
         for case_id, target, scan, mask in iterate_over_timepoints(batch):
-            logger.info(
-                f"{case_id}: {target}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
-            )
+            if mask is not None:
+                logger.info(
+                    f"{case_id}: {target}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
+                )
+            else:
+                logger.info(
+                    f"{case_id}: {target}, {scan.shape, scan.dtype}, <mask not available>"
+                )
