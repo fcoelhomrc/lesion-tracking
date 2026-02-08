@@ -596,8 +596,6 @@ def generate_folds(
         logger.debug(f"Overwriting {str(folds_json)}...")
 
     assert 0.0 < test_size < 1.0, f"Test size must be between 0 and 1, got {test_size}"
-    if stratified:
-        assert stratification_key is not None, "Missing stratification key"
 
     _, cases, metadata = scan_dataset_dir(dataset_path)
     num_cases = len(cases)
@@ -607,11 +605,42 @@ def generate_folds(
     }  # fold: {train, val, test}
 
     if stratified:
+        assert stratification_key is not None, "Stratification key was not provided."
+
         # TODO: finish implementation.
         # Need to work on metadata/targets on dataset implementation.
+        case_metadata = [metadata.get(case) for case in cases]
+
+        # Keep only cases that provide the specified stratification key
+        filtered_cases, targets = [], []
+        for case, case_metadata in zip(cases, case_metadata):
+            if case_metadata is None:
+                continue
+            target = parse_metadata(case_metadata, [stratification_key])
+            target = target[stratification_key]
+            if target is None:
+                continue
+            if not isinstance(target, int):
+                # FIXME: convert categorical to int targets
+                logger.error(
+                    f"Value might not be compatible with StratifiedKFold: {target}"
+                )
+            filtered_cases.append(case)
+            targets.append(target)
+
+        cases = filtered_cases
+
+        if num_cases != len(cases):
+            logger.warning(
+                f"Not all cases provide {stratification_key} values for stratified K-fold computation. "
+                f"Folds will be generated using only {len(cases)}/{num_cases} cases. "
+            )
+
+        # Update indices (possibly a subset of available data)
+        num_cases = len(cases)
         indices = list(range(num_cases))
-        case_metadata = "todo"
-        targets = [parse_metadata(case_metadata)]
+
+        logger.debug(f"Targets for stratified K-Fold: {targets}")
 
         train_val_indices, test_indices, train_val_targets, test_targets = (
             train_test_split(indices, targets, test_size=test_size, random_state=seed)
@@ -621,7 +650,15 @@ def generate_folds(
         for i, (train_indices, val_indices) in enumerate(
             folds.split(train_val_indices, train_val_targets)
         ):
-            pass
+            # Keep indexing consistent
+            train_indices = np.asarray(train_val_indices)[train_indices].tolist()
+            val_indices = np.asarray(train_val_indices)[val_indices].tolist()
+            # Store fold in a human-readable format
+            results[str(i)] = {
+                "train": [cases[j] for j in train_indices],
+                "val": [cases[j] for j in val_indices],
+                "test": [cases[j] for j in test_indices],
+            }
 
     else:
         indices = list(range(num_cases))
@@ -703,7 +740,7 @@ def get_loader(
 
 
 if __name__ == "__main__":
-    dataset_path = "inputs/dummy"
+    dataset_path = "inputs/neov"
     dataset = LongitudinalDataset(dataset_path, caching_strategy="disk", task="crs")
     logger.info(
         f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
@@ -729,7 +766,14 @@ if __name__ == "__main__":
     def test_caching(dataset, idx):
         _ = dataset[idx]
 
-    generate_folds(dataset_path, overwrite=True, test_size=0.2, num_folds=2)
+    generate_folds(
+        dataset_path,
+        overwrite=True,
+        test_size=0.2,
+        num_folds=2,
+        stratified=True,
+        stratification_key="treatment.chemotherapy_response_score",
+    )
 
     loader = get_loader(
         dataset_path,
