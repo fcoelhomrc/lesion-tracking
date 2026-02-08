@@ -165,68 +165,60 @@ TASKS = {
 }
 
 
-def get_target(metadata: dict, task: TaskDef) -> dict[str, Any]:
-    result = {}
-    for path in task.keys:
-        keys = path.split(".")
-        value = metadata
-        for key in keys:
-            value = value[key]
-        result[path] = value
-    return result
-
-
 class FeatureGroup(Enum):
     CLINICAL_BASIC = ["clinical.age_at_diagnosis", "ca125.ca125_level_at_diagnosis"]
 
 
-def get_features(metadata: dict, groups: list[FeatureGroup]) -> dict[str, Any]:
+def parse_metadata(
+    metadata: dict, paths: list[str] | list[FeatureGroup]
+) -> dict[str, Any]:
     """
     metadata: dict obtained from per-case metadata.json file.
     """
-    features = {}
+    # Normalize: flatten FeatureGroups into plain strings
+    if paths and isinstance(paths[0], FeatureGroup):
+        paths = [p for g in paths for p in g.value]
+
+    result = {}
     # Parses nested dicts obtained from metadata json
-    for group in groups:  # Group = Set of keys
-        for path in group.value:
-            keys = path.split(".")  # Use dot notation to represent nested keys
-            value = metadata
-            for key in keys:
-                try:
-                    value = value[key]  # Go one level deeper into chain
-                except Exception as error:
-                    # Extract all valid paths
-                    def get_paths(d, p=""):
-                        for k, v in d.items():
-                            full_path = f"{p}{k}"
-                            if isinstance(v, dict):
-                                yield from get_paths(v, f"{full_path}.")
-                            else:
-                                yield full_path
+    for path in paths:
+        keys = path.split(".")  # Use dot notation to represent nested keys
+        value = metadata
+        for key in keys:
+            try:
+                value = value[key]  # Go one level deeper into chain
+            except Exception as error:
+                # Extract all valid paths
+                def get_paths(d, p=""):
+                    for k, v in d.items():
+                        full_path = f"{p}{k}"
+                        if isinstance(v, dict):
+                            yield from get_paths(v, f"{full_path}.")
+                        else:
+                            yield full_path
 
-                    all_paths = list(get_paths(metadata))
+                all_paths = list(get_paths(metadata))
 
-                    # Find plausible valid paths to suggest
-                    import difflib
+                # Find plausible valid paths to suggest
+                import difflib
 
-                    suggestions = difflib.get_close_matches(
-                        key, all_paths, n=3, cutoff=0.4
-                    )
-                    suggestion_text = (
-                        f"💡 Did you mean: {', '.join(suggestions)}?"
-                        if suggestions
-                        else "❌ No close matches found."
-                    )
+                suggestions = difflib.get_close_matches(key, all_paths, n=3, cutoff=0.4)
+                suggestion_text = (
+                    f"💡 Did you mean: {', '.join(suggestions)}?"
+                    if suggestions
+                    else "❌ No close matches found."
+                )
 
-                    raise RuntimeError(
-                        f"Error while parsing metadata to retrieve features.\n"
-                        f"Level:       {key}\n"
-                        f"Target path: {path}\n\n"
-                        f"{suggestion_text}\n\n"
-                        f"Available paths:\n  - " + "\n  - ".join(all_paths)
-                    ) from error
+                raise RuntimeError(
+                    f"Error while parsing metadata to retrieve features.\n"
+                    f"Level:       {key}\n"
+                    f"Target path: {path}\n\n"
+                    f"{suggestion_text}\n\n"
+                    f"Available paths:\n  - " + "\n  - ".join(all_paths)
+                ) from error
 
-            features[path] = value  # Retrieve value after reaching the end
-    return features
+        result[path] = value  # Retrieve value after reaching the end
+    return result
 
 
 # TODO: Support per-timepoint metadata
@@ -370,13 +362,13 @@ class LongitudinalDataset(Dataset):
         if self._task:
             case_metadata = self._metadata.get(case_id)
             if case_metadata is not None:
-                target = get_target(case_metadata, self._task)
+                target = parse_metadata(case_metadata, self._task.keys)
 
         features = None
         if self._feature_groups:
             case_metadata = self._metadata.get(case_id)
             if case_metadata is not None:
-                features = get_features(case_metadata, self._feature_groups)
+                features = parse_metadata(case_metadata, self._feature_groups)
 
         return {
             "case_id": case_id,
@@ -607,7 +599,7 @@ def generate_folds(
     if stratified:
         assert stratification_key is not None, "Missing stratification key"
 
-    _, cases, _ = scan_dataset_dir(dataset_path)
+    _, cases, metadata = scan_dataset_dir(dataset_path)
     num_cases = len(cases)
     results = {
         "stratified": stratified,
@@ -618,7 +610,8 @@ def generate_folds(
         # TODO: finish implementation.
         # Need to work on metadata/targets on dataset implementation.
         indices = list(range(num_cases))
-        targets = []
+        case_metadata = "todo"
+        targets = [parse_metadata(case_metadata)]
 
         train_val_indices, test_indices, train_val_targets, test_targets = (
             train_test_split(indices, targets, test_size=test_size, random_state=seed)
