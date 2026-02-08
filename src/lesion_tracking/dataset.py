@@ -154,7 +154,7 @@ TASKS = {
     ),
     "recist": TaskDef(
         name="recist",
-        keys=["imaging.RECIST_category"],
+        keys=["imaging.recist_category"],
         task_type="classification",
     ),
     "survival": TaskDef(
@@ -177,18 +177,55 @@ def get_target(metadata: dict, task: TaskDef) -> dict[str, Any]:
 
 
 class FeatureGroup(Enum):
-    CLINICAL_BASIC = ["clinical.age", "clinical.ca125_level_at_diagnosis"]
+    CLINICAL_BASIC = ["clinical.age_at_diagnosis", "ca125.ca125_level_at_diagnosis"]
 
 
 def get_features(metadata: dict, groups: list[FeatureGroup]) -> dict[str, Any]:
+    """
+    metadata: dict obtained from per-case metadata.json file.
+    """
     features = {}
-    for group in groups:
+    # Parses nested dicts obtained from metadata json
+    for group in groups:  # Group = Set of keys
         for path in group.value:
-            keys = path.split(".")
+            keys = path.split(".")  # Use dot notation to represent nested keys
             value = metadata
             for key in keys:
-                value = value[key]
-            features[path] = value
+                try:
+                    value = value[key]  # Go one level deeper into chain
+                except Exception as error:
+                    # Extract all valid paths
+                    def get_paths(d, p=""):
+                        for k, v in d.items():
+                            full_path = f"{p}{k}"
+                            if isinstance(v, dict):
+                                yield from get_paths(v, f"{full_path}.")
+                            else:
+                                yield full_path
+
+                    all_paths = list(get_paths(metadata))
+
+                    # Find plausible valid paths to suggest
+                    import difflib
+
+                    suggestions = difflib.get_close_matches(
+                        key, all_paths, n=3, cutoff=0.4
+                    )
+                    suggestion_text = (
+                        f"💡 Did you mean: {', '.join(suggestions)}?"
+                        if suggestions
+                        else "❌ No close matches found."
+                    )
+
+                    raise RuntimeError(
+                        f"Error while parsing metadata to retrieve features.\n"
+                        f"Level:       {key}\n"
+                        f"Target path: {path}\n\n"
+                        f"{suggestion_text}\n\n"
+                        f"Available paths:\n  - " + "\n  - ".join(all_paths)
+                    ) from error
+
+            features[path] = value  # Retrieve value after reaching the end
     return features
 
 
@@ -335,10 +372,17 @@ class LongitudinalDataset(Dataset):
             if case_metadata is not None:
                 target = get_target(case_metadata, self._task)
 
+        features = None
+        if self._feature_groups:
+            case_metadata = self._metadata.get(case_id)
+            if case_metadata is not None:
+                features = get_features(case_metadata, self._feature_groups)
+
         return {
             "case_id": case_id,
             "tp": tp,
             "target": target,
+            "features": features,
             "scan": data["scan"],
             "mask": data.get("mask"),
         }
@@ -486,10 +530,14 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
         items = sorted(items, key=lambda x: x["tp"])
         # NOTE: Target is per-case, so take from first item (all items have same target)
         target = items[0]["target"]
+        # NOTE: Features are per-case, so take from first item (all items have same features)
+        features = items[0]["features"]
+
         result.append(
             {
                 "case_id": case_id,
                 "target": target,
+                "features": features,
                 "contents": [
                     {"scan": item["scan"], "mask": item.get("mask"), "tp": item["tp"]}
                     for item in items
@@ -500,24 +548,28 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
     return {
         "case_ids": [r["case_id"] for r in result],
         "targets": [r["target"] for r in result],  # per-case targets
+        "features": [
+            r["features"] for r in result
+        ],  # per-case additional features (e.g. clinical)
         "contents": [r["contents"] for r in result],
     }
 
 
-def iterate_over_cases(batch) -> Iterator[tuple[str, Any, list]]:
+def iterate_over_cases(batch) -> Iterator[tuple[str, Any, Any, list]]:
     batched_case_ids = batch.get("case_ids")
     batched_targets = batch.get("targets")
+    batched_features = batch.get("features")
     batched_contents = batch.get("contents")
-    for case_id, target, contents in zip(
-        batched_case_ids, batched_targets, batched_contents
+    for case_id, target, features, contents in zip(
+        batched_case_ids, batched_targets, batched_features, batched_contents
     ):
-        yield case_id, target, contents
+        yield case_id, target, features, contents
 
 
 def iterate_over_timepoints(batch) -> Iterator[tuple]:
-    for case_id, target, contents in iterate_over_cases(batch):
+    for case_id, target, features, contents in iterate_over_cases(batch):
         for each in contents:
-            yield case_id, target, each["scan"], each["mask"]
+            yield case_id, target, features, each["scan"], each["mask"]
 
 
 def without_channel(x: torch.Tensor) -> torch.Tensor:
@@ -555,7 +607,7 @@ def generate_folds(
     if stratified:
         assert stratification_key is not None, "Missing stratification key"
 
-    _, cases, metadata = scan_dataset_dir(dataset_path)
+    _, cases, _ = scan_dataset_dir(dataset_path)
     num_cases = len(cases)
     results = {
         "stratified": stratified,
@@ -623,6 +675,7 @@ def get_loader(
     dataset_path,
     preprocessing_config,
     task: Optional[str] = None,
+    feature_groups: Optional[list[FeatureGroup]] = None,
     fold: Optional[int] = None,
     split: Literal["train", "val", "test"] | None = None,
     cases_per_batch: int = 1,
@@ -633,6 +686,7 @@ def get_loader(
         dataset_path=dataset_path,
         preprocessing_config=preprocessing_config,
         task=task,
+        feature_groups=feature_groups,
         caching_strategy="disk",
     )
 
@@ -688,6 +742,7 @@ if __name__ == "__main__":
         dataset_path,
         {"spacing": (1.0, 1.0, 1.0), "normalization": "zscore"},
         task="crs",
+        feature_groups=[FeatureGroup.CLINICAL_BASIC],
         fold=1,
         split="train",
         cases_per_batch=2,
@@ -695,12 +750,12 @@ if __name__ == "__main__":
 
     logger.debug(f"Loader size: {len(loader)}")
     for batch in loader:
-        for case_id, target, scan, mask in iterate_over_timepoints(batch):
+        for case_id, target, features, scan, mask in iterate_over_timepoints(batch):
             if mask is not None:
                 logger.info(
-                    f"{case_id}: {target}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
+                    f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
                 )
             else:
                 logger.info(
-                    f"{case_id}: {target}, {scan.shape, scan.dtype}, <mask not available>"
+                    f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, <mask not available>"
                 )
