@@ -4,12 +4,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from time import perf_counter
 from typing import Any, Iterator, Literal, Mapping, Optional, Sequence
 
 import einops
 import numpy as np
-import pandas as pd
 import torch
 from monai.data.image_reader import NibabelReader
 from monai.transforms.compose import Compose
@@ -37,7 +35,7 @@ from monai.transforms.utility.dictionary import (
     EnsureChannelFirstd,
     ToTensord,
 )
-from torch.utils.data import DataLoader, Dataset, Sampler, Subset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from lesion_tracking.logger import get_logger, track_runtime
 
@@ -287,7 +285,7 @@ class LongitudinalDataset(Dataset):
             for _, _, scan, mask in flat_items
         ]
 
-        if self._caching_strategy == None:
+        if self._caching_strategy is None:
             raise NotImplementedError("Running without caching is not supported yet.")
         elif self._caching_strategy == "ram":
             from monai.data.dataset import CacheDataset
