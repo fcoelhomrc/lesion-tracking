@@ -13,12 +13,20 @@ import pandas as pd
 import torch
 from monai.data.image_reader import NibabelReader
 from monai.transforms import (
-    AsDiscreted,
+    CastToTyped,
     Compose,
     EnsureChannelFirstd,
     LoadImaged,
     NormalizeIntensityd,
     Orientationd,
+    Rand3DElasticd,
+    RandAdjustContrastd,
+    RandAffined,
+    RandGaussianNoised,
+    RandGaussianSmoothd,
+    RandRotated,
+    RandScaleIntensityd,
+    RandZoomd,
     ScaleIntensityRanged,
     Spacingd,
     ToTensord,
@@ -244,6 +252,7 @@ class LongitudinalDataset(Dataset):
         feature_groups: list[FeatureGroup] | None = None,
         caching_strategy: Literal["ram", "disk"] | None = "disk",
         cache_dir: Optional[str] = None,
+        enable_augmentations: bool = True,
     ) -> None:
         super().__init__()
         self._dataset_path = dataset_path
@@ -252,6 +261,7 @@ class LongitudinalDataset(Dataset):
         self._feature_groups = feature_groups
         self._caching_strategy = caching_strategy
         self._cache_dir = cache_dir
+        self._enable_augmentations = enable_augmentations
 
         self._prepare_full_pipeline()
         self._prepare_dataset()
@@ -279,8 +289,11 @@ class LongitudinalDataset(Dataset):
             from monai.data import PersistentDataset
             from monai.data.utils import pickle_hashing
 
-            # FIXME: relative path depends on CWD; consider requiring absolute path or deriving from dataset_path
-            cache_dir = Path(self._cache_dir) if self._cache_dir else Path(".cache")
+            cache_dir = (
+                Path(self._cache_dir)
+                if self._cache_dir
+                else Path(self._dataset_path) / ".cache"
+            )
             cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Disk-based caching enabled. Saving to {str(cache_dir)}")
 
@@ -293,7 +306,6 @@ class LongitudinalDataset(Dataset):
         else:
             raise ValueError(f"Invalid caching strategy: {self._caching_strategy}")
 
-        # FIXME: should use metadata to provide targets
         self._metadata = metadata
         self._cases = cases
         self._flat_items = [
@@ -453,25 +465,101 @@ class LongitudinalDataset(Dataset):
         self._loading_pipeline = Compose(pipeline)
 
     # TODO: implement data augmentation transforms (deterministic should come before random transforms!)
-    def _prepare_augmentations(self): ...
+    def _prepare_augmentations(self):
+        spatial_keys = ["scan", "mask"]
+        self._augmentation_pipeline = Compose(
+            [
+                # Spatial transforms (scan + mask)
+                Rand3DElasticd(
+                    keys=spatial_keys,
+                    sigma_range=(0.05, 0.05),
+                    magnitude_range=(0.05, 0.05),
+                    prob=1.0,
+                    mode=("bilinear", "nearest"),
+                    allow_missing_keys=True,
+                ),
+                RandRotated(
+                    keys=spatial_keys,
+                    range_x=np.deg2rad(5),
+                    range_y=np.deg2rad(5),
+                    range_z=np.deg2rad(5),
+                    prob=1.0,
+                    mode=("bilinear", "nearest"),
+                    allow_missing_keys=True,
+                ),
+                RandZoomd(
+                    keys=spatial_keys,
+                    min_zoom=0.95,
+                    max_zoom=1.05,
+                    prob=0.5,
+                    mode=("bilinear", "nearest"),
+                    allow_missing_keys=True,
+                ),
+                RandAffined(
+                    keys=spatial_keys,
+                    translate_range=(5, 5, 5),
+                    prob=1.0,
+                    mode=("bilinear", "nearest"),
+                    allow_missing_keys=True,
+                ),
+                # Intensity transforms (scan only)
+                RandGaussianNoised(
+                    keys=["scan"],
+                    std=0.05,
+                    prob=1.0,
+                ),
+                RandGaussianSmoothd(
+                    keys=["scan"],
+                    sigma_x=(0.1, 0.2),
+                    sigma_y=(0.1, 0.2),
+                    sigma_z=(0.1, 0.2),
+                    prob=0.1,
+                ),
+                RandScaleIntensityd(
+                    keys=["scan"],
+                    factors=(-0.25, 0.25),
+                    prob=0.15,
+                ),
+                RandAdjustContrastd(
+                    keys=["scan"],
+                    gamma=(0.75, 1.25),
+                    retain_stats=True,
+                    prob=0.15,
+                ),
+            ]
+        )
 
     def _prepare_full_pipeline(self):
+        full_pipeline = []
+
+        # Deterministic transforms - can be cached
         self._prepare_loader()
-        self._prepare_augmentations()
-        self._full_pipeline = Compose(
+        full_pipeline.extend([self._loading_pipeline])
+        full_pipeline.extend(
             [
-                self._loading_pipeline,
                 ToTensord(
                     keys=["scan", "mask"],
                     allow_missing_keys=True,
                 ),
-                AsDiscreted(
+            ]
+        )
+
+        # Random augmentations - computed at runtime
+        if self._enable_augmentations:
+            self._prepare_augmentations()
+            full_pipeline.extend([self._augmentation_pipeline])
+
+        full_pipeline.extend(
+            [
+                CastToTyped(
                     keys=["mask"],
+                    dtype=torch.long,
                     allow_missing_keys=True,
-                ),  # FIXME: not working? Masks are f32 instead of i16
-                # self._augmentation_pipeline,
-            ],
-        ).flatten()
+                ),
+            ]
+        )
+
+        self._full_pipeline = Compose(full_pipeline).flatten()
 
     def refresh_cache(self):
         """
@@ -620,11 +708,6 @@ def generate_folds(
             target = target[stratification_key]
             if target is None:
                 continue
-            if not isinstance(target, int):
-                # FIXME: convert categorical to int targets
-                logger.error(
-                    f"Value might not be compatible with StratifiedKFold: {target}"
-                )
             filtered_cases.append(case)
             targets.append(target)
 
@@ -740,7 +823,7 @@ def get_loader(
 
 
 if __name__ == "__main__":
-    dataset_path = "inputs/neov"
+    dataset_path = "inputs/barts"
     dataset = LongitudinalDataset(dataset_path, caching_strategy="disk", task="crs")
     logger.info(
         f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
@@ -765,6 +848,9 @@ if __name__ == "__main__":
     @track_runtime(logger=logger, buffer=buffer)
     def test_caching(dataset, idx):
         _ = dataset[idx]
+
+    for idx in [0, 0, 1, 1, 2, 2]:
+        test_caching(dataset, idx)
 
     generate_folds(
         dataset_path,
