@@ -30,6 +30,7 @@ from monai.transforms.spatial.dictionary import (
     RandZoomd,
     Spacingd,
 )
+from monai.transforms.transform import MapTransform
 from monai.transforms.utility.dictionary import (
     CastToTyped,
     EnsureChannelFirstd,
@@ -69,7 +70,11 @@ def sort_dict_of_lists(d: dict[str, list]) -> dict[str, list]:
 
 # TODO: validate NIfTI headers early (e.g., nibabel.load()) to catch corrupted files at startup
 def scan_dataset_dir(
-    path: str | Path, allow_missing_masks: bool = False
+    path: str | Path,
+    scans_dir: str = "scans",
+    masks_dir: str = "masks",
+    allow_missing_scans: bool = False,
+    allow_missing_masks: bool = False,
 ) -> tuple[list, list, dict]:
     """
     Scans dataset directory.
@@ -127,18 +132,21 @@ def scan_dataset_dir(
             with open(case_metadata_path) as f:
                 metadata[case_id] = json.load(f)
 
-        scans = sorted(str(p) for p in (item / "scans").glob("*.nii.gz"))
-        masks = sorted(str(p) for p in (item / "masks").glob("*.nii.gz"))
+        scans = sorted(str(p) for p in (item / scans_dir).glob("*.nii.gz"))
+        masks = sorted(str(p) for p in (item / masks_dir).glob("*.nii.gz"))
 
         pad_missing_tps(scans, masks)  # Interleaves 'None' where timepoint is missing
 
-        # Missing scans is not allowed
-        assert None not in scans, f"Found missing scan for {case_id}: {scans}"
+        # Missing scans might be tolerated
+        if not allow_missing_scans:
+            assert None not in scans, (
+                f"Found missing scan for {case_id}: {scans}. If that is intended, consider setting `allow_missing_scans=True`."
+            )
 
         # Missing masks might be tolerated
         if not allow_missing_masks:
-            assert len(scans) == len(masks), (
-                f"{item.name} has mismatched scans/masks: {len(scans)} vs {len(masks)}"
+            assert None not in masks, (
+                f"Found missing mask for {case_id}: {masks}. If that is intended, consider setting `allow_missing_masks=True`."
             )
 
         for tp, (scan, mask) in enumerate(zip(scans, masks)):
@@ -254,6 +262,10 @@ class LongitudinalDataset(Dataset):
     def __init__(
         self,
         dataset_path: str | Path,
+        scans_dir: Optional[str] = None,
+        masks_dir: Optional[str] = None,
+        allow_missing_scans: Optional[bool] = None,
+        allow_missing_masks: Optional[bool] = None,
         preprocessing_config: dict = {
             "spacing": (1.0, 1.0, 1.0),
             "normalization": "zscore",
@@ -265,25 +277,44 @@ class LongitudinalDataset(Dataset):
         enable_augmentations: bool = True,
     ) -> None:
         super().__init__()
+
         self._dataset_path = dataset_path
+
+        self._scans_dir = scans_dir
+        self._masks_dir = masks_dir
+        self._allow_missing_scans = allow_missing_scans
+        self._allow_missing_masks = allow_missing_masks
+
         self._preprocessing_config = preprocessing_config
+
         self._task = TASKS.get(task) if task is not None else None
         self._feature_groups = feature_groups
+
         self._caching_strategy = caching_strategy
         self._cache_dir = cache_dir
+
         self._enable_augmentations = enable_augmentations
 
         self._prepare_full_pipeline()
         self._prepare_dataset()
 
     def _prepare_dataset(self):
-        flat_items, cases, metadata = scan_dataset_dir(self._dataset_path)
+        kwargs = {
+            "scans_dir": self._scans_dir,
+            "masks_dir": self._masks_dir,
+            "allow_missing_scans": self._allow_missing_scans,
+            "allow_missing_masks": self._allow_missing_masks,
+        }
+        flat_items, cases, metadata = scan_dataset_dir(
+            self._dataset_path,
+            **{k: v for k, v in kwargs.items() if v is not None},
+        )
 
         # This attribute is static and should not change after class is instantiated.
-        self._data_dicts: Sequence[dict[str, str]] = [
-            {"scan": scan, "mask": mask} if mask is not None else {"scan": scan}
-            for _, _, scan, mask in flat_items
-        ]
+        self._data_dicts: Sequence[dict[str, str]] = []
+        for _, _, scan, mask in flat_items:
+            data = {"scan": scan, "mask": mask}
+            self._data_dicts.append({k: v for k, v in data.items() if v is not None})
 
         if self._caching_strategy is None:
             raise NotImplementedError("Running without caching is not supported yet.")
@@ -397,7 +428,7 @@ class LongitudinalDataset(Dataset):
             "tp": tp,
             "target": target,
             "features": features,
-            "scan": data["scan"],
+            "scan": data.get("scan"),
             "mask": data.get("mask"),
         }
 
@@ -412,6 +443,8 @@ class LongitudinalDataset(Dataset):
 
         The API handles differences in preprocessing steps between volumes and segmentation masks,
         while automatically updating the affine matrix.
+
+        NOTE: Overrides `allow_missing_keys` parameter for every transform, setting it to `True`
         """
 
         pipeline = [
@@ -420,25 +453,21 @@ class LongitudinalDataset(Dataset):
                 reader="NibabelReader",
                 as_closest_canonical=True,
                 squeeze_non_spatial_dims=False,
-                allow_missing_keys=True,
             ),
             EnsureChannelFirstd(
                 keys=["scan", "mask"],
-                allow_missing_keys=True,
             ),
             # Reorienting
             Orientationd(
                 keys=["scan", "mask"],
                 axcodes="RAS",
                 labels=None,
-                allow_missing_keys=True,
             ),
             # Resampling
             Spacingd(
                 keys=["scan", "mask"],
                 pixdim=self._preprocessing_config["spacing"],
                 mode=("bilinear", "nearest"),
-                allow_missing_keys=True,
             ),
         ]
 
@@ -450,7 +479,6 @@ class LongitudinalDataset(Dataset):
                     NormalizeIntensityd(
                         keys=["scan"],
                         channel_wise=True,
-                        allow_missing_keys=True,
                     ),
                 ]
             )
@@ -465,7 +493,6 @@ class LongitudinalDataset(Dataset):
                         b_min=0.0,
                         b_max=1.0,
                         clip=True,
-                        allow_missing_keys=True,
                     ),
                 ]
             )
@@ -485,7 +512,6 @@ class LongitudinalDataset(Dataset):
                     magnitude_range=(0.05, 0.05),
                     prob=1.0,
                     mode=("bilinear", "nearest"),
-                    allow_missing_keys=True,
                 ),
                 RandRotated(
                     keys=spatial_keys,
@@ -494,7 +520,6 @@ class LongitudinalDataset(Dataset):
                     range_z=np.deg2rad(5),
                     prob=1.0,
                     mode=("bilinear", "nearest"),
-                    allow_missing_keys=True,
                 ),
                 RandZoomd(
                     keys=spatial_keys,
@@ -502,14 +527,12 @@ class LongitudinalDataset(Dataset):
                     max_zoom=1.05,
                     prob=0.5,
                     mode=("bilinear", "nearest"),
-                    allow_missing_keys=True,
                 ),
                 RandAffined(
                     keys=spatial_keys,
                     translate_range=(5, 5, 5),
                     prob=1.0,
                     mode=("bilinear", "nearest"),
-                    allow_missing_keys=True,
                 ),
                 # Intensity transforms (scan only)
                 RandGaussianNoised(
@@ -544,14 +567,6 @@ class LongitudinalDataset(Dataset):
         # Deterministic transforms - can be cached
         self._prepare_loader()
         full_pipeline.extend([self._loading_pipeline])
-        full_pipeline.extend(
-            [
-                ToTensord(
-                    keys=["scan", "mask"],
-                    allow_missing_keys=True,
-                ),
-            ]
-        )
 
         # Random augmentations - computed at runtime
         if self._enable_augmentations:
@@ -560,15 +575,24 @@ class LongitudinalDataset(Dataset):
 
         full_pipeline.extend(
             [
+                ToTensord(
+                    keys=["scan", "mask"],
+                ),
                 CastToTyped(
                     keys=["mask"],
-                    dtype=torch.long,
-                    allow_missing_keys=True,
+                    dtype=int,
                 ),
             ]
         )
 
-        self._full_pipeline = Compose(full_pipeline).flatten()
+        full_pipeline = Compose(full_pipeline).flatten()
+
+        # Guarantees that missing keys do not throw errors
+        # See source code for monai.transforms.utils.allow_missing_keys_mode
+        for t in [t for t in full_pipeline.transforms if isinstance(t, MapTransform)]:
+            t.allow_missing_keys = True
+
+        self._full_pipeline = full_pipeline
 
     def refresh_cache(self):
         """
@@ -628,7 +652,11 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
                 "target": target,
                 "features": features,
                 "contents": [
-                    {"scan": item["scan"], "mask": item.get("mask"), "tp": item["tp"]}
+                    {
+                        "scan": item.get("scan"),
+                        "mask": item.get("mask"),
+                        "tp": item["tp"],
+                    }
                     for item in items
                 ],
             }
@@ -669,6 +697,10 @@ def without_channel(x: torch.Tensor) -> torch.Tensor:
 
 def generate_folds(
     dataset_path: str | Path,
+    scans_dir: Optional[str] = None,
+    masks_dir: Optional[str] = None,
+    allow_missing_scans: Optional[bool] = None,
+    allow_missing_masks: Optional[bool] = None,
     overwrite: bool = False,
     test_size: float = 0.5,
     num_folds: int = 5,  # Non-overlapping folds!
@@ -694,7 +726,17 @@ def generate_folds(
 
     assert 0.0 < test_size < 1.0, f"Test size must be between 0 and 1, got {test_size}"
 
-    _, cases, metadata = scan_dataset_dir(dataset_path)
+    kwargs = {
+        "scans_dir": scans_dir,
+        "masks_dir": masks_dir,
+        "allow_missing_scans": allow_missing_scans,
+        "allow_missing_masks": allow_missing_masks,
+    }
+    _, cases, metadata = scan_dataset_dir(
+        dataset_path,
+        **{k: v for k, v in kwargs.items() if v is not None},
+    )
+
     num_cases = len(cases)
     results = {
         "stratified": stratified,
@@ -794,6 +836,7 @@ def load_folds(
 def get_loader(
     dataset_path,
     preprocessing_config,
+    enable_augmentations: bool = False,
     task: Optional[str] = None,
     feature_groups: Optional[list[FeatureGroup]] = None,
     fold: Optional[int] = None,
@@ -801,13 +844,22 @@ def get_loader(
     cases_per_batch: int = 1,
     shuffle: bool = False,
     num_workers: int = 1,
+    scans_dir: Optional[str] = None,
+    masks_dir: Optional[str] = None,
+    allow_missing_scans: Optional[bool] = None,
+    allow_missing_masks: Optional[bool] = None,
 ):
     dataset = LongitudinalDataset(
         dataset_path=dataset_path,
+        scans_dir=scans_dir,
+        masks_dir=masks_dir,
+        allow_missing_scans=allow_missing_scans,
+        allow_missing_masks=allow_missing_masks,
         preprocessing_config=preprocessing_config,
         task=task,
         feature_groups=feature_groups,
         caching_strategy="disk",
+        enable_augmentations=enable_augmentations,
     )
 
     if fold is not None:
@@ -830,62 +882,95 @@ def get_loader(
 
 
 if __name__ == "__main__":
-    dataset_path = "inputs/barts"
-    dataset = LongitudinalDataset(dataset_path, caching_strategy="disk", task="crs")
-    logger.info(
-        f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
-    )
-    logger.info(f"Cases: {dataset._cases}")
+    dataset_path = "inputs/dummy"
 
-    sample = dataset[0]
-    assert sample is not None
-    assert isinstance(sample, dict)
+    def test_dataset(dataset_path):
+        dataset = LongitudinalDataset(
+            dataset_path,
+            caching_strategy="disk",
+            task="crs",
+            allow_missing_scans=True,
+            allow_missing_masks=True,
+        )
+        logger.info(
+            f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
+        )
+        logger.info(f"Cases: {dataset._cases}")
 
-    logger.info(f"case_id -> {sample['case_id']}")
-    logger.info(f"tp -> {sample['tp']}")
-    logger.info(f"target -> {sample['target']}")
-    logger.info(f"scan -> {sample['scan'].shape, sample['scan'].dtype}")
-    if sample.get("mask") is not None:
-        logger.info(f"mask -> {sample['mask'].shape, sample['mask'].dtype}")
-    else:
-        logger.info("mask -> not available")
+        sample = dataset[0]
+        assert sample is not None
+        assert isinstance(sample, dict)
 
-    buffer = []
+        logger.info(f"case_id -> {sample['case_id']}")
+        logger.info(f"tp -> {sample['tp']}")
+        logger.info(f"target -> {sample['target']}")
+        logger.info(f"scan -> {sample['scan'].shape, sample['scan'].dtype}")
+        if sample.get("mask") is not None:
+            logger.info(f"mask -> {sample['mask'].shape, sample['mask'].dtype}")
+        else:
+            logger.info("mask -> not available")
 
-    @track_runtime(logger=logger, buffer=buffer)
-    def test_caching(dataset, idx):
-        _ = dataset[idx]
+    def test_caching(dataset_path):
+        dataset = LongitudinalDataset(
+            dataset_path,
+            caching_strategy="disk",
+            task="crs",
+            allow_missing_scans=True,
+            allow_missing_masks=True,
+        )
 
-    for idx in [0, 0, 1, 1, 2, 2]:
-        test_caching(dataset, idx)
+        buffer = []
 
-    generate_folds(
-        dataset_path,
-        overwrite=True,
-        test_size=0.2,
-        num_folds=2,
-        stratified=True,
-        stratification_key="treatment.chemotherapy_response_score",
-    )
+        @track_runtime(logger=logger, buffer=buffer)
+        def retreive_sample(dataset, idx):
+            _ = dataset[idx]
 
-    loader = get_loader(
-        dataset_path,
-        {"spacing": (1.0, 1.0, 1.0), "normalization": "zscore"},
-        task="crs",
-        feature_groups=[FeatureGroup.CLINICAL_BASIC],
-        fold=1,
-        split="train",
-        cases_per_batch=2,
-    )
+        for idx in [0, 0, 1, 1, 2, 2]:
+            retreive_sample(dataset, idx)
 
-    logger.debug(f"Loader size: {len(loader)}")
-    for batch in loader:
-        for case_id, target, features, scan, mask in iterate_over_timepoints(batch):
-            if mask is not None:
-                logger.info(
-                    f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
-                )
-            else:
-                logger.info(
-                    f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, <mask not available>"
-                )
+    # generate_folds(
+    #     dataset_path,
+    #     overwrite=True,
+    #     test_size=0.2,
+    #     num_folds=2,
+    #     stratified=True,
+    #     stratification_key="treatment.chemotherapy_response_score",
+    # )
+
+    def test_loader(dataset_path):
+        loader = get_loader(
+            dataset_path,
+            {"spacing": (1.0, 1.0, 1.0), "normalization": "zscore"},
+            task="crs",
+            feature_groups=[FeatureGroup.CLINICAL_BASIC],
+            fold=None,
+            # split="train",
+            cases_per_batch=2,
+            allow_missing_scans=True,
+            allow_missing_masks=True,
+        )
+
+        logger.debug(f"Loader size: {len(loader)}")
+        for batch in loader:
+            for case_id, target, features, scan, mask in iterate_over_timepoints(batch):
+                match scan, mask:
+                    case None, None:
+                        logger.info(
+                            f"{case_id}: {target}, {features}, <scan not available>, <mask not available>"
+                        )
+                    case None, _:
+                        logger.info(
+                            f"{case_id}: {target}, {features}, <scan not available>, {mask.shape, mask.dtype}"
+                        )
+                    case _, None:
+                        logger.info(
+                            f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, <mask not available>"
+                        )
+                    case _:
+                        logger.info(
+                            f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
+                        )
+
+    # test_dataset(dataset_path)
+    # test_caching(dataset_path)
+    test_loader(dataset_path)
