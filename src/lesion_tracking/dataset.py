@@ -11,6 +11,9 @@ import numpy as np
 import torch
 from monai.data.image_reader import NibabelReader
 from monai.transforms.compose import Compose
+from monai.transforms.croppad.dictionary import (
+    ResizeWithPadOrCropd,
+)
 from monai.transforms.intensity.dictionary import (
     NormalizeIntensityd,
     RandAdjustContrastd,
@@ -34,6 +37,7 @@ from monai.transforms.transform import MapTransform
 from monai.transforms.utility.dictionary import (
     CastToTyped,
     EnsureChannelFirstd,
+    Lambdad,
     ToTensord,
 )
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -44,6 +48,46 @@ logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
 CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
+
+# NOTE: How is 3D data usually processed by models?
+# 2D approach - iterate over slices (usually Z-axis)
+# 2.5D approach - iterate over K consecutive slices
+# 3D approach - iterate over patches (randomly cropped)
+#
+# In every case, we have exactly 1 dimension to iterate over:
+#
+# 2D approach - Input: (C, Z, Y, X) -> iterate over Z
+# 2.5D approach - Input: (C, Z, Y, X) -> iterate over Z:Z+K with stride of K
+# 3D approach - Input: (N, C, Z', Y', X') -> iterate over N sampled patches
+#
+# Should this logic be baked in the Dataset object?
+# Pros: less work to do by caller
+# Cons: preprocessing depends on mode, e.g. 3D approach - you want to crop early to reduce memory requirement
+#
+# Longitudinal data
+# Each case can have up to L scans (assume general case - variable length)
+#
+# Assumption: preprocessing will homogenize spatial dimensions
+# -> We can stack the scans belonging to the same sequence
+# e.g. 2D approach - Input: (L, C, Z, Y, X)
+# e.g. 2.5D approach - Input: (L, C, Z, Y, X)
+# e.g. 3D approach - Input: (L, N, C, Z', Y', X')
+#
+# Batching - Group B cases together
+#
+# Assumption: L is consistent *across cases* - Does not hold.
+# Strategy: Padding + Attention Mask (if applicable)
+# e.g. 2D approach - Input: (B, L, C, Z, Y, X)
+# e.g. 2.5D approach - Input: (B, L, C, Z, Y, X)
+# e.g. 3D approach - Input: (B, L, N, C, Z', Y', X')
+#
+# Assumption: Z is consistent *across images* and/or *across cases* - Does not hold.
+# To have the L batching (time) or the B batching (case)
+# we need same number of slices (Z) - not true
+# e.g. resample 5mm and 2mm scan to 1mm (isotropic 1x1x1)
+#      same target spacing => different shapes (Z)
+# Strategy: Still apply cropping, but use large Z-direction dimension e.g. (128x128x300)
+# => Issue: Some images might not have Z < Z_target, and cropping fails => Zero-padidng?
 
 
 def load_nifti(path: str | Path):
@@ -250,8 +294,8 @@ def parse_metadata(
 # TODO: Support per-timepoint metadata
 # Main use case: associate real-world time for each scan.
 # e.g. Diagnosis t=0, and then every scan has t given in months relative to diagnosis.
-# Currently, we return a "target" key for every scan,
-# but the targets comer from case-level metadata ("target" values are the same for a given case_id).
+# Currently, we return a "targets" key for every scan,
+# but the targets comer from case-level metadata ("targets" values are the same for a given case_id).
 # Hence, longitudinal_collate_fn retains only the first occurence when building "targets".
 # To support per-timepoint metadata, we need to update this logic,
 # e.g. __getitem__ returns "case_metadata" and "tp_metadata",
@@ -267,6 +311,8 @@ class LongitudinalDataset(Dataset):
         allow_missing_scans: Optional[bool] = None,
         allow_missing_masks: Optional[bool] = None,
         preprocessing_config: dict = {
+            "mode": "2d",
+            "target_size": (128, 128, 128),
             "spacing": (1.0, 1.0, 1.0),
             "normalization": "zscore",
         },
@@ -392,19 +438,19 @@ class LongitudinalDataset(Dataset):
         return len(self._flat_items)
 
     def __getitem__(self, idx) -> dict:
-        # NOTE: 'mask' key now holds an optional value
-        # We have relaxed assumption that mask is always present
-        # If mask is null, Monai transforms will break.
-        # We need to omit the mask key from self._data_dicts, such that
+        # NOTE: 'scan' and 'mask' key now holds an optional value
+        # We have relaxed assumption that scan/mask are always present
+        # If key holds a null value, Monai transforms will break.
+        # We need to omit null-valued keys from self._data_dicts, such that
         # the Monai transform may silently skip missing keys (allow_missing_keys=True)
         # instead of raising exception on null value.
         # Then, after retrieving the transform output, __getitem__ either
-        # i) uses the mask value present
-        # ii) correctly assumes there was no mask available, and includes "mask": None in output dict
+        # i) uses the available value
+        # ii) correctly assumes there was no scan/mask available, and includes "scan/mask": None in output dict
         # Advantages:
         # i) Keeps __getitem__ output signature static
         # ii) Keeps compatibility with Monai transforms
-        # iii) Defers handling optional mask to caller
+        # iii) Defers handling optionals to caller
         case_id, tp, global_idx = self._flat_items[idx]
         data = self._base_dataset[global_idx]  # returns a dict
         assert isinstance(data, Mapping), (
@@ -426,7 +472,7 @@ class LongitudinalDataset(Dataset):
         return {
             "case_id": case_id,
             "tp": tp,
-            "target": target,
+            "targets": target,
             "features": features,
             "scan": data.get("scan"),
             "mask": data.get("mask"),
@@ -561,12 +607,36 @@ class LongitudinalDataset(Dataset):
             ]
         )
 
+    @staticmethod
+    def _ensure_uniform_tensor_shape(x: list | torch.Tensor) -> torch.Tensor:
+        return torch.stack(x) if isinstance(x, list) else x.unsqueeze(0)
+
     def _prepare_full_pipeline(self):
         full_pipeline = []
 
         # Deterministic transforms - can be cached
         self._prepare_loader()
         full_pipeline.extend([self._loading_pipeline])
+
+        # Volume handling strategy
+        mode = self._preprocessing_config.get("mode")
+        if mode == "2d":
+            target_size = self._preprocessing_config.get("target_size")
+            assert target_size is not None, (
+                f"Preprocessing - Must specify `target_size` (tuple[int, int, int]) for mode {mode}."
+            )
+            full_pipeline.extend(
+                [
+                    ResizeWithPadOrCropd(
+                        keys=["scan", "mask"],
+                        spatial_size=target_size,
+                        mode="minimum",
+                    ),
+                ]
+            )
+
+        else:
+            raise NotImplementedError(f"Preprocessing - Mode {mode} is not available.")
 
         # Random augmentations - computed at runtime
         if self._enable_augmentations:
@@ -581,6 +651,13 @@ class LongitudinalDataset(Dataset):
                 CastToTyped(
                     keys=["mask"],
                     dtype=int,
+                ),
+                # NOTE: When we do transforms like random cropping, we get a list of patches
+                #       To keep shapes consistent, we add dummy dimension if no patching is used
+                #       i.e. output shape should always be (patch, channel, z, y, x)
+                Lambdad(
+                    keys=["scan", "mask"],
+                    func=self._ensure_uniform_tensor_shape,
                 ),
             ]
         )
@@ -633,60 +710,288 @@ class CaseGroupedBatchSampler(Sampler):
         ) // self.cases_per_batch
 
 
+# NOTE: How Dataset, Sampler, DataLoader, and Collator interact?
+# Dataset.__getitem__(idx) reads data from disk into ram
+# Sampler randomly selects groups of indices
+# DataLoader fetches the selected indices from Dataset (supports parallelization)
+# Collator organizes the loaded data into a batch
+
+# NOTE: Description of collator input
+# This comment might be outdated, always check Dataset.__getitem__ signature
+# item = {
+#     "case_id": str,
+#     "tp": int,
+#     "targets": dict[str, Any],
+#     "features": dict[str, Any],
+#     "scan": Optional[torch.Tensor],
+#     "mask": Optional[torch.Tensor],
+# }
+# Collator receives a list[item]
+
+
 def longitudinal_collate_fn(batch: list[dict]) -> dict:
+    """
+    Output: dict[str, *]
+
+    Shapes:
+    B - Batch size = Cases
+    L - Timepoints
+    N - Patches
+    C - Channels
+    Z,Y,X - Spatial dims
+    M - Tabular data = Columns
+
+    Key/Values:
+    'case_ids' -> list[str]
+    'targets' -> dict[torch.Tensor]  (shape: B) e.g. {'crs': int} or {'event': int, 'time_survival': float}
+    'features' -> dict[torch.Tensor] (shape: B, M) e.g. {'clinical': *, 'genomics': *},
+    'imaging' -> dict[torch.Tensor] (shape: B, L, N, C, Z, Y, X | B, L) e.g. {'scans': *, 'masks': *, 'is_padded': bool}
+    """
+    # Map: case_id -> list[item] where each item is item[case_id, tp, target, features, scan, mask]
+    # i.e.  this groups together all timepoints available for the case_id
     cases = defaultdict(list)
+
+    # Map: case_id -> list[int] with available tps obtained from item[tp]
+    # i.e. this helps us understand how to pad the sequences
+    tps = defaultdict(list)
+
+    target_keys = set()
+    feature_keys = set()
+
     for item in batch:
         cases[item["case_id"]].append(item)
+        tps[item["case_id"]].append(item["tp"])
 
-    result = []
-    for case_id, items in cases.items():
-        items = sorted(items, key=lambda x: x["tp"])
-        # NOTE: Target is per-case, so take from first item (all items have same target)
-        target = items[0]["target"]
-        # NOTE: Features are per-case, so take from first item (all items have same features)
-        features = items[0]["features"]
+        # NOTE: We are assuming that these keys are consistent (but what about optionals?)
+        for key in item["targets"]:
+            target_keys.add(key)
+        for key in item["features"]:
+            feature_keys.add(key)
 
-        result.append(
-            {
-                "case_id": case_id,
-                "target": target,
-                "features": features,
-                "contents": [
-                    {
-                        "scan": item.get("scan"),
-                        "mask": item.get("mask"),
-                        "tp": item["tp"],
-                    }
-                    for item in items
-                ],
-            }
+    # Sort by chronological order (t0 -> t1 -> t2 -> ...)
+    cases = {k: sorted(v, key=lambda x: x["tp"]) for k, v in cases.items()}
+    tps = {k: sorted(v) for k, v in tps.items()}
+
+    output = {}
+    output["case_ids"] = []
+    output["targets"] = {k: [] for k in target_keys}
+    output["features"] = {k: [] for k in feature_keys}
+
+    output["_imaging"] = {
+        "scans": [],
+        "masks": [],
+        "is_padded": [],
+    }  # Temporary buffers to stack along temporal axis
+
+    imaging: dict[str, torch.Tensor | None] = {
+        "scans": None,
+        "masks": None,
+        "is_padded": None,
+    }
+    output["imaging"] = imaging
+
+    # Infer expected tensor shape by looking at first example
+    expected_shape = None
+    for case, items in cases.items():
+        for item in items:
+            scan = item.get("scan")
+            if scan is not None:
+                assert isinstance(scan, torch.Tensor), (
+                    f"Expected torch.Tensor, found {type(scan)}"
+                )
+                assert scan.ndim == 5, (
+                    f"Expected 5D tensor, found {scan.ndim, scan.shape}"
+                )
+                expected_shape = scan.shape
+                break
+            mask = item.get("mask")
+            if mask is not None:
+                assert isinstance(mask, torch.Tensor), (
+                    f"Expected torch.Tensor, found {type(mask)}"
+                )
+                assert mask.ndim == 5, (
+                    f"Expected 5D tensor, found {mask.ndim, mask.shape}"
+                )
+                expected_shape = mask.shape
+                break
+    assert expected_shape is not None, (
+        "Batch does not contain valid data. You should probably check your dataset integrity."
+    )
+
+    # NOTE: Padding logic
+    # The Dataset uses optionals to handle missing timepoints for a given case,
+    # e.g. {scans: t0, t1} -> {t0, t1, None}
+    #      {masks: t2}     -> {None, None, t2}
+    # However, between cases, we might still have inconsistencies that require padding:
+    # e.g. {case_1: t0, t1} -> {t0, t1}
+    #      {case_2: t0}     -> {t0, <padding>}
+
+    PADDING_CONSTANT = 0
+    tp_max = max([max(tp) for tp in tps.values()])
+    expected_sequence_length = tp_max + 1  # tps are indexed from zero (t0, t1, t2, ...)
+
+    def get_padding():
+        return PADDING_CONSTANT * torch.ones(expected_shape)
+
+    for case, items in cases.items():
+        output["case_ids"].append(case)
+
+        # NOTE: Per-case targets and features, so we can take from first available timepoint
+        for k, v in items[0]["targets"].items():
+            output["targets"][k].append(v)
+
+        for k, v in items[0]["features"].items():
+            output["features"][k].append(v)
+
+        # TODO: Need to pad the temporal sequence for stacking
+        # FIXME: Will break if missing scans and/or masks because padding is not yet implemented
+        # NOTE: We assume that spatial dimensions are already consistent
+        # NOTE: We assume that channels are already consistent
+        # NOTE: We assume that patches are already consistent
+
+        tps_available = []
+        scans_to_stack = []
+        masks_to_stack = []
+        _is_padded = []
+
+        for item in items:
+            tps_available.append(item.get("tp"))
+            scan = item.get("scan")
+            mask = item.get("mask")
+
+            if scan is None or mask is None:
+                scan = get_padding() if scan is None else scan
+                mask = get_padding() if mask is None else mask
+                _is_padded.append(True)
+            else:
+                _is_padded.append(False)
+
+            assert scan.shape == expected_shape, (
+                f"Found scan with shape {scan.shape}, expected {expected_shape}"
+            )
+            assert mask.shape == expected_shape, (
+                f"Found mask with shape {mask.shape}, expected {expected_shape}"
+            )
+
+            scans_to_stack.append(scan)
+            masks_to_stack.append(mask)
+
+        # Apply padding
+        if tps_available != [i for i in range(0, tp_max + 1)]:
+            logger.debug(
+                "Collator - Applying padding due to timepoint mismatch between cases in batch"
+            )
+            for i in range(0, tp_max + 1):
+                if i not in tps_available:
+                    scans_to_stack.insert(i, get_padding())
+                    masks_to_stack.insert(i, get_padding())
+                    _is_padded.insert(i, True)
+
+        assert len(scans_to_stack) == expected_sequence_length, (
+            f"Expected scans sequence with {expected_sequence_length} elements, got {len(scans_to_stack)}"
+        )
+        assert len(masks_to_stack) == expected_sequence_length, (
+            f"Expected masks sequence with {expected_sequence_length} elements, got {len(masks_to_stack)}"
+        )
+        assert len(_is_padded) == expected_sequence_length, (
+            f"Expected padding sequence with {expected_sequence_length} elements, got {len(_is_padded)} "
+            f"(padding: {_is_padded}, timepoints available: {tps_available})"
         )
 
-    return {
-        "case_ids": [r["case_id"] for r in result],
-        "targets": [r["target"] for r in result],  # per-case targets
-        "features": [
-            r["features"] for r in result
-        ],  # per-case additional features (e.g. clinical)
-        "contents": [r["contents"] for r in result],
-    }
+        output["_imaging"]["scans"].append(
+            torch.stack(scans_to_stack)
+        )  # (tp, patch, channel, z, y, x)
+        output["_imaging"]["masks"].append(
+            torch.stack(masks_to_stack)
+        )  # (tp, patch, channel, z, y, x)
+        output["_imaging"]["is_padded"].append(
+            torch.tensor(_is_padded, dtype=torch.bool)
+        )  # (tp, )
+
+    output["imaging"]["scans"] = torch.stack(
+        output["_imaging"]["scans"]  # (batch, tp, patch, channel, z, y, x)
+    )
+    output["imaging"]["masks"] = torch.stack(
+        output["_imaging"]["masks"]  # (batch, tp, patch, channel, z, y, x)
+    )
+    output["imaging"]["is_padded"] = torch.stack(
+        output["_imaging"]["is_padded"]  # (batch, tp)
+    )
+
+    output.pop("_imaging")  # Remove the temporary buffers
+
+    return output
 
 
-def iterate_over_cases(batch) -> Iterator[tuple[str, Any, Any, list]]:
-    batched_case_ids = batch.get("case_ids")
-    batched_targets = batch.get("targets")
-    batched_features = batch.get("features")
-    batched_contents = batch.get("contents")
-    for case_id, target, features, contents in zip(
-        batched_case_ids, batched_targets, batched_features, batched_contents
+def iterate_over_cases(
+    batch,
+) -> Iterator[tuple]:
+    """
+    Batch:
+
+    'case_ids' -> list[str]
+    'targets' -> dict[torch.Tensor]  (shape: B) e.g. {'crs': int} or {'event': int, 'time_survival': float}
+    'features' -> dict[torch.Tensor] (shape: B, M) e.g. {'clinical': *, 'genomics': *},
+    'imaging' -> dict[torch.Tensor] (shape: B, L, N, C, Z, Y, X | B, L) e.g. {'scans': *, 'masks': *, 'is_padded': bool}
+
+    Output:
+
+    case_id -> str,
+    targets -> {key: int/float},
+    features -> {key: torch.Tensor (shape: M, )},
+    scans -> torch.Tensor (shape: L, N, C, Z, Y, X),
+    masks -> torch.Tensor (shape: L, N, C, Z, Y, X),
+    is_padded -> torch.Tensor (shape: L, ),
+    """
+
+    case_ids = batch.get("case_ids")
+    targets = batch.get("targets")
+    features = batch.get("features")
+    imaging = batch.get("imaging")
+    scans = imaging["scans"]
+    masks = imaging["masks"]
+    is_padded = imaging["is_padded"]
+
+    for i in range(len(case_ids)):
+        yield (
+            case_ids[i],
+            {k: v[i] for k, v in targets.items()},
+            {k: v[i] for k, v in features.items()},
+            scans[i],
+            masks[i],
+            is_padded[i],
+        )
+
+
+def iterate_over_timepoints(
+    batch,
+) -> Iterator[tuple]:
+    """
+    See `iterate_over_cases` signature.
+
+    Output:
+
+    case_id -> str,
+    targets -> {key: int/float},
+    features -> {key: torch.Tensor (shape: M, )},
+    scans -> torch.Tensor (shape: N, C, Z, Y, X),
+    masks -> torch.Tensor (shape:  N, C, Z, Y, X),
+    is_padded -> bool,
+    """
+    # FIXME: this is broken, need to check logic
+
+    for case_id, targets, features, scans, masks, is_padded in iterate_over_cases(
+        batch
     ):
-        yield case_id, target, features, contents
-
-
-def iterate_over_timepoints(batch) -> Iterator[tuple]:
-    for case_id, target, features, contents in iterate_over_cases(batch):
-        for each in contents:
-            yield case_id, target, features, each["scan"], each["mask"]
+        for i in range(scans.shape[0]):
+            yield (
+                case_id,
+                targets,
+                features,
+                scans[i],
+                masks[i],
+                is_padded[i],
+            )
 
 
 def without_channel(x: torch.Tensor) -> torch.Tensor:
@@ -882,11 +1187,18 @@ def get_loader(
 
 
 if __name__ == "__main__":
-    dataset_path = "inputs/dummy"
+    dataset_path = "inputs/barts"
+    preprocessing_config = {
+        "mode": "2d",
+        "target_size": (96, 128, 128),
+        "spacing": (5.0, 1.0, 1.0),
+        "normalization": "zscore",
+    }
 
-    def test_dataset(dataset_path):
+    def test_dataset(dataset_path, preprocessing_config):
         dataset = LongitudinalDataset(
             dataset_path,
+            preprocessing_config=preprocessing_config,
             caching_strategy="disk",
             task="crs",
             allow_missing_scans=True,
@@ -904,15 +1216,21 @@ if __name__ == "__main__":
         logger.info(f"case_id -> {sample['case_id']}")
         logger.info(f"tp -> {sample['tp']}")
         logger.info(f"target -> {sample['target']}")
-        logger.info(f"scan -> {sample['scan'].shape, sample['scan'].dtype}")
+
+        if sample.get("scan") is not None:
+            logger.info(f"scan -> {sample['scan'].shape, sample['scan'].dtype}")
+        else:
+            logger.info("scan -> <not available>")
+
         if sample.get("mask") is not None:
             logger.info(f"mask -> {sample['mask'].shape, sample['mask'].dtype}")
         else:
             logger.info("mask -> not available")
 
-    def test_caching(dataset_path):
+    def test_caching(dataset_path, preprocessing_config):
         dataset = LongitudinalDataset(
             dataset_path,
+            preprocessing_config=preprocessing_config,
             caching_strategy="disk",
             task="crs",
             allow_missing_scans=True,
@@ -928,19 +1246,10 @@ if __name__ == "__main__":
         for idx in [0, 0, 1, 1, 2, 2]:
             retreive_sample(dataset, idx)
 
-    # generate_folds(
-    #     dataset_path,
-    #     overwrite=True,
-    #     test_size=0.2,
-    #     num_folds=2,
-    #     stratified=True,
-    #     stratification_key="treatment.chemotherapy_response_score",
-    # )
-
-    def test_loader(dataset_path):
+    def test_loader(dataset_path, preprocessing_config):
         loader = get_loader(
             dataset_path,
-            {"spacing": (1.0, 1.0, 1.0), "normalization": "zscore"},
+            preprocessing_config=preprocessing_config,
             task="crs",
             feature_groups=[FeatureGroup.CLINICAL_BASIC],
             fold=None,
@@ -948,11 +1257,14 @@ if __name__ == "__main__":
             cases_per_batch=2,
             allow_missing_scans=True,
             allow_missing_masks=True,
+            num_workers=0,
         )
 
         logger.debug(f"Loader size: {len(loader)}")
         for batch in loader:
-            for case_id, target, features, scan, mask in iterate_over_timepoints(batch):
+            for case_id, target, features, scan, mask, _ in iterate_over_timepoints(
+                batch
+            ):
                 match scan, mask:
                     case None, None:
                         logger.info(
@@ -971,6 +1283,15 @@ if __name__ == "__main__":
                             f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
                         )
 
-    # test_dataset(dataset_path)
-    # test_caching(dataset_path)
-    test_loader(dataset_path)
+    # generate_folds(
+    #     dataset_path,
+    #     overwrite=True,
+    #     test_size=0.2,
+    #     num_folds=2,
+    #     stratified=True,
+    #     stratification_key="treatment.chemotherapy_response_score",
+    # )
+
+    # test_dataset(dataset_path, preprocessing_config)
+    # test_caching(dataset_path, preprocessing_config)
+    test_loader(dataset_path, preprocessing_config)
