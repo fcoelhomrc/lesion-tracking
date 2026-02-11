@@ -105,6 +105,12 @@ def without_file_ext(s: str | Path):
     return s.name.split(".")[0]
 
 
+def without_channel(x: torch.Tensor) -> torch.Tensor:
+    assert x.ndim == 4
+    assert x.shape[0] == 1  # single-channel image
+    return einops.rearrange(x, "1 h w d -> h w d")
+
+
 def sort_dict_of_lists(d: dict[str, list]) -> dict[str, list]:
     d_sorted = {}
     for k, v in d.items():
@@ -716,21 +722,39 @@ class CaseGroupedBatchSampler(Sampler):
 # DataLoader fetches the selected indices from Dataset (supports parallelization)
 # Collator organizes the loaded data into a batch
 
-# NOTE: Description of collator input
-# This comment might be outdated, always check Dataset.__getitem__ signature
-# item = {
-#     "case_id": str,
-#     "tp": int,
-#     "targets": dict[str, Any],
-#     "features": dict[str, Any],
-#     "scan": Optional[torch.Tensor],
-#     "mask": Optional[torch.Tensor],
-# }
-# Collator receives a list[item]
+
+def _infer_expected_shape(cases: dict) -> torch.Size:
+    for items in cases.values():
+        for item in items:
+            for key in ("scan", "mask"):
+                tensor = item.get(key)
+                if tensor is not None:
+                    assert isinstance(tensor, torch.Tensor), (
+                        f"Expected torch.Tensor, found {type(tensor)}"
+                    )
+                    assert tensor.ndim == 5, (
+                        f"Expected 5D tensor, found {tensor.ndim, tensor.shape}"
+                    )
+                    return tensor.shape
+    raise ValueError(
+        "Batch does not contain valid data. You should probably check your dataset integrity."
+    )
 
 
 def longitudinal_collate_fn(batch: list[dict]) -> dict:
     """
+    WARN: This signature might be outdated, always check Dataset.__getitem__ signature
+
+    Input: list[item] where
+    item = {
+        "case_id": str,
+        "tp": int,
+        "targets": dict[str, Any],
+        "features": dict[str, Any],
+        "scan": Optional[torch.Tensor],
+        "mask": Optional[torch.Tensor],
+    }
+
     Output: dict[str, *]
 
     Shapes:
@@ -751,74 +775,24 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
     # i.e.  this groups together all timepoints available for the case_id
     cases = defaultdict(list)
 
-    # Map: case_id -> list[int] with available tps obtained from item[tp]
-    # i.e. this helps us understand how to pad the sequences
-    tps = defaultdict(list)
-
-    target_keys = set()
-    feature_keys = set()
-
     for item in batch:
         cases[item["case_id"]].append(item)
-        tps[item["case_id"]].append(item["tp"])
-
-        # NOTE: We are assuming that these keys are consistent (but what about optionals?)
-        for key in item["targets"]:
-            target_keys.add(key)
-        for key in item["features"]:
-            feature_keys.add(key)
 
     # Sort by chronological order (t0 -> t1 -> t2 -> ...)
     cases = {k: sorted(v, key=lambda x: x["tp"]) for k, v in cases.items()}
-    tps = {k: sorted(v) for k, v in tps.items()}
+
+    # NOTE: We are assuming that these keys are consistent across cases
+    target_keys = batch[0]["targets"].keys()
+    feature_keys = batch[0]["features"].keys()
 
     output = {}
     output["case_ids"] = []
     output["targets"] = {k: [] for k in target_keys}
     output["features"] = {k: [] for k in feature_keys}
 
-    output["_imaging"] = {
-        "scans": [],
-        "masks": [],
-        "is_padded": [],
-    }  # Temporary buffers to stack along temporal axis
+    expected_shape = _infer_expected_shape(cases)
 
-    imaging: dict[str, torch.Tensor | None] = {
-        "scans": None,
-        "masks": None,
-        "is_padded": None,
-    }
-    output["imaging"] = imaging
-
-    # Infer expected tensor shape by looking at first example
-    expected_shape = None
-    for case, items in cases.items():
-        for item in items:
-            scan = item.get("scan")
-            if scan is not None:
-                assert isinstance(scan, torch.Tensor), (
-                    f"Expected torch.Tensor, found {type(scan)}"
-                )
-                assert scan.ndim == 5, (
-                    f"Expected 5D tensor, found {scan.ndim, scan.shape}"
-                )
-                expected_shape = scan.shape
-                break
-            mask = item.get("mask")
-            if mask is not None:
-                assert isinstance(mask, torch.Tensor), (
-                    f"Expected torch.Tensor, found {type(mask)}"
-                )
-                assert mask.ndim == 5, (
-                    f"Expected 5D tensor, found {mask.ndim, mask.shape}"
-                )
-                expected_shape = mask.shape
-                break
-    assert expected_shape is not None, (
-        "Batch does not contain valid data. You should probably check your dataset integrity."
-    )
-
-    # NOTE: Padding logic
+    # NOTE: Padding logic (what should we use as padding_value?)
     # The Dataset uses optionals to handle missing timepoints for a given case,
     # e.g. {scans: t0, t1} -> {t0, t1, None}
     #      {masks: t2}     -> {None, None, t2}
@@ -826,14 +800,17 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
     # e.g. {case_1: t0, t1} -> {t0, t1}
     #      {case_2: t0}     -> {t0, <padding>}
 
-    PADDING_CONSTANT = 0
-    tp_max = max([max(tp) for tp in tps.values()])
-    expected_sequence_length = tp_max + 1  # tps are indexed from zero (t0, t1, t2, ...)
+    padding_value = 0
+    tp_max = max(item["tp"] for item in batch)
+    seq_length = tp_max + 1  # tps are indexed from zero (t0, t1, t2, ...)
+    batch_size = len(cases)
 
-    def get_padding():
-        return PADDING_CONSTANT * torch.ones(expected_shape)
+    # Pre-allocate output tensors
+    scans_out = torch.full((batch_size, seq_length, *expected_shape), padding_value)
+    masks_out = torch.full((batch_size, seq_length, *expected_shape), padding_value)
+    is_padded_out = torch.ones(batch_size, seq_length, dtype=torch.bool)
 
-    for case, items in cases.items():
+    for i, (case, items) in enumerate(cases.items()):
         output["case_ids"].append(case)
 
         # NOTE: Per-case targets and features, so we can take from first available timepoint
@@ -843,82 +820,32 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
         for k, v in items[0]["features"].items():
             output["features"][k].append(v)
 
-        # TODO: Need to pad the temporal sequence for stacking
-        # FIXME: Will break if missing scans and/or masks because padding is not yet implemented
-        # NOTE: We assume that spatial dimensions are already consistent
-        # NOTE: We assume that channels are already consistent
-        # NOTE: We assume that patches are already consistent
-
-        tps_available = []
-        scans_to_stack = []
-        masks_to_stack = []
-        _is_padded = []
-
+        # NOTE: We assume that spatial dimensions, channels, and patches are already consistent
         for item in items:
-            tps_available.append(item.get("tp"))
+            tp = item["tp"]
             scan = item.get("scan")
             mask = item.get("mask")
 
-            if scan is None or mask is None:
-                scan = get_padding() if scan is None else scan
-                mask = get_padding() if mask is None else mask
-                _is_padded.append(True)
-            else:
-                _is_padded.append(False)
+            if scan is not None:
+                assert scan.shape == expected_shape, (
+                    f"Found scan with shape {scan.shape}, expected {expected_shape}"
+                )
+                scans_out[i, tp] = scan
 
-            assert scan.shape == expected_shape, (
-                f"Found scan with shape {scan.shape}, expected {expected_shape}"
-            )
-            assert mask.shape == expected_shape, (
-                f"Found mask with shape {mask.shape}, expected {expected_shape}"
-            )
+            if mask is not None:
+                assert mask.shape == expected_shape, (
+                    f"Found mask with shape {mask.shape}, expected {expected_shape}"
+                )
+                masks_out[i, tp] = mask
 
-            scans_to_stack.append(scan)
-            masks_to_stack.append(mask)
+            if scan is not None and mask is not None:
+                is_padded_out[i, tp] = False
 
-        # Apply padding
-        if tps_available != [i for i in range(0, tp_max + 1)]:
-            logger.debug(
-                "Collator - Applying padding due to timepoint mismatch between cases in batch"
-            )
-            for i in range(0, tp_max + 1):
-                if i not in tps_available:
-                    scans_to_stack.insert(i, get_padding())
-                    masks_to_stack.insert(i, get_padding())
-                    _is_padded.insert(i, True)
-
-        assert len(scans_to_stack) == expected_sequence_length, (
-            f"Expected scans sequence with {expected_sequence_length} elements, got {len(scans_to_stack)}"
-        )
-        assert len(masks_to_stack) == expected_sequence_length, (
-            f"Expected masks sequence with {expected_sequence_length} elements, got {len(masks_to_stack)}"
-        )
-        assert len(_is_padded) == expected_sequence_length, (
-            f"Expected padding sequence with {expected_sequence_length} elements, got {len(_is_padded)} "
-            f"(padding: {_is_padded}, timepoints available: {tps_available})"
-        )
-
-        output["_imaging"]["scans"].append(
-            torch.stack(scans_to_stack)
-        )  # (tp, patch, channel, z, y, x)
-        output["_imaging"]["masks"].append(
-            torch.stack(masks_to_stack)
-        )  # (tp, patch, channel, z, y, x)
-        output["_imaging"]["is_padded"].append(
-            torch.tensor(_is_padded, dtype=torch.bool)
-        )  # (tp, )
-
-    output["imaging"]["scans"] = torch.stack(
-        output["_imaging"]["scans"]  # (batch, tp, patch, channel, z, y, x)
-    )
-    output["imaging"]["masks"] = torch.stack(
-        output["_imaging"]["masks"]  # (batch, tp, patch, channel, z, y, x)
-    )
-    output["imaging"]["is_padded"] = torch.stack(
-        output["_imaging"]["is_padded"]  # (batch, tp)
-    )
-
-    output.pop("_imaging")  # Remove the temporary buffers
+    output["imaging"] = {
+        "scans": scans_out,  # (batch, tp, patch, channel, z, y, x)
+        "masks": masks_out,  # (batch, tp, patch, channel, z, y, x)
+        "is_padded": is_padded_out,  # (batch, tp)
+    }
 
     return output
 
@@ -992,12 +919,6 @@ def iterate_over_timepoints(
                 masks[i],
                 is_padded[i],
             )
-
-
-def without_channel(x: torch.Tensor) -> torch.Tensor:
-    assert x.ndim == 4
-    assert x.shape[0] == 1  # single-channel image
-    return einops.rearrange(x, "1 h w d -> h w d")
 
 
 def generate_folds(
