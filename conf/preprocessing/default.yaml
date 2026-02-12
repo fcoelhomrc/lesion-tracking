@@ -1,0 +1,4 @@
+mode: "2d"
+target_size: [128, 128, 128]
+spacing: [1.0, 1.0, 1.0]
+normalization: zscore

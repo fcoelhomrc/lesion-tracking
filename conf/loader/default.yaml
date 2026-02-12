@@ -1,0 +1,5 @@
+cases_per_batch: 1
+shuffle: false
+num_workers: 1
+fold: null
+split: null

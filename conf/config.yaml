@@ -1,0 +1,4 @@
+defaults:
+  - dataset: default
+  - preprocessing: default
+  - loader: default
