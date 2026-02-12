@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping, Sequence
 
+import cc3d
 import einops
 import numpy as np
 import torch
@@ -39,12 +40,64 @@ from monai.transforms.utility.dictionary import (
     Lambdad,
     ToTensord,
 )
+from numpy.typing import NDArray
+from scipy import ndimage
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from lesion_tracking.logger import get_logger, track_runtime
 
 logger = get_logger(__name__)
 logger.setLevel("DEBUG")
+
+
+def extract_body(volume: torch.Tensor, fill_value: float = -1000.0) -> torch.Tensor:
+    """Extract the patient body from a CT volume, removing the bed.
+
+    Args:
+        volume: 5D tensor of shape (N, C, X, Y, Z) with N=1, C=1. Values in HU.
+        fill_value: Value to fill outside the body mask (default: -1000 HU, air).
+
+    Returns:
+        Volume with same shape, background replaced by fill_value.
+    """
+    assert volume.ndim == 5, f"Expected 5D tensor, got {volume.ndim}D"
+    assert volume.shape[0] == 1 and volume.shape[1] == 1, (
+        f"Expected N=1, C=1, got N={volume.shape[0]}, C={volume.shape[1]}"
+    )
+
+    vol_3d = einops.rearrange(volume, "1 1 x y z -> x y z").numpy()
+
+    # Threshold at -500 HU to separate body from air
+    mask = vol_3d > -500.0
+
+    # Erode to break thin bridges between body and bed
+    mask = ndimage.binary_erosion(mask, iterations=3)
+
+    # Keep only the largest connected component (the body)
+    labels = cc3d.connected_components(mask.astype(np.uint8))
+    if labels.max() > 0:
+        component_sizes = np.bincount(labels.ravel())
+        component_sizes[0] = 0  # ignore background
+        mask = labels == component_sizes.argmax()
+
+    # Fill holes per axial slice (2D) — more robust than 3D fill since
+    # airways/trachea can connect interior to exterior in 3D
+    for z in range(mask.shape[2]):
+        mask[:, :, z] = ndimage.binary_fill_holes(mask[:, :, z])
+
+    # Dilate to restore original body boundary
+    mask = ndimage.binary_dilation(mask, iterations=3)
+
+    # Apply mask
+    vol_3d[~mask] = fill_value
+
+    result = torch.from_numpy(vol_3d)
+    return einops.rearrange(result, "x y z -> 1 1 x y z")
+
+
+def _ensure_uniform_tensor_shape(x: list | torch.Tensor) -> torch.Tensor:
+    return torch.stack(x) if isinstance(x, list) else x.unsqueeze(0)
+
 
 CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
 
@@ -378,6 +431,8 @@ class LongitudinalDataset(Dataset):
             cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Disk-based caching enabled. Saving to {str(cache_dir)}")
 
+            # FIXME: I think there is something wrong with num_workers > 0
+            #        NEOV reported 50 cases found, setting num_workers = 0 -> expected 99 cases
             self._base_dataset = PersistentDataset(
                 data=self._data_dicts,
                 transform=self._full_pipeline,
@@ -397,9 +452,11 @@ class LongitudinalDataset(Dataset):
         for flat_idx, (case_id, _, _) in enumerate(self._flat_items):
             self._case_to_flat_indices[case_id].append(flat_idx)
 
+    @property
     def num_scans(self) -> int:
         return len(self._base_dataset)
 
+    @property
     def num_cases(self) -> int:
         return len(self._cases)
 
@@ -512,34 +569,6 @@ class LongitudinalDataset(Dataset):
             ),
         ]
 
-        normalization = self._normalization
-        if normalization == "zscore":
-            # Z-score normalization
-            pipeline.extend(
-                [
-                    NormalizeIntensityd(
-                        keys=["scan"],
-                        channel_wise=True,
-                    ),
-                ]
-            )
-        elif normalization == "soft_tissue":
-            # Soft tissue window: center=50 HU, width=500 HU -> [-150, 250] HU
-            pipeline.extend(
-                [
-                    ScaleIntensityRanged(
-                        keys=["scan"],
-                        a_min=-150.0,
-                        a_max=250.0,
-                        b_min=0.0,
-                        b_max=1.0,
-                        clip=True,
-                    ),
-                ]
-            )
-        else:
-            raise ValueError(f"Invalid normalization: {normalization}")
-
         self._loading_pipeline = Compose(pipeline)
 
     def _prepare_augmentations(self):
@@ -602,10 +631,6 @@ class LongitudinalDataset(Dataset):
             ]
         )
 
-    @staticmethod
-    def _ensure_uniform_tensor_shape(x: list | torch.Tensor) -> torch.Tensor:
-        return torch.stack(x) if isinstance(x, list) else x.unsqueeze(0)
-
     def _prepare_full_pipeline(self):
         full_pipeline = []
 
@@ -618,9 +643,16 @@ class LongitudinalDataset(Dataset):
             full_pipeline.extend(
                 [
                     ResizeWithPadOrCropd(
-                        keys=["scan", "mask"],
+                        keys=["scan"],
                         spatial_size=self._target_size,
-                        mode="minimum",
+                        mode="constant",
+                        constant_values=-1000,  # HU unit for air
+                    ),
+                    ResizeWithPadOrCropd(
+                        keys=["mask"],
+                        spatial_size=self._target_size,
+                        mode="constant",
+                        constant_values=0,
                     ),
                 ]
             )
@@ -628,6 +660,37 @@ class LongitudinalDataset(Dataset):
             raise NotImplementedError(
                 f"Preprocessing - Mode {self._mode} is not available."
             )
+
+        # Normalization strategy
+        if self._normalization == "zscore":
+            # Z-score normalization
+            full_pipeline.extend(
+                [
+                    NormalizeIntensityd(
+                        keys=["scan"],
+                        channel_wise=True,
+                    ),
+                ]
+            )
+        elif self._normalization == "soft_tissue":
+            # Soft tissue window: center=50 HU, width=500 HU -> [-150, 250] HU
+            full_pipeline.extend(
+                [
+                    ScaleIntensityRanged(
+                        keys=["scan"],
+                        a_min=-150.0,
+                        a_max=250.0,
+                        b_min=0.0,
+                        b_max=1.0,
+                        clip=True,
+                    ),
+                ]
+            )
+        elif self._normalization == "hu_units":
+            # Do not apply any normalizations
+            pass
+        else:
+            raise ValueError(f"Invalid normalization: {self._normalization}")
 
         # Random augmentations - computed at runtime
         if self._enable_augmentations:
@@ -648,7 +711,7 @@ class LongitudinalDataset(Dataset):
                 #       i.e. output shape should always be (patch, channel, z, y, x)
                 Lambdad(
                     keys=["scan", "mask"],
-                    func=self._ensure_uniform_tensor_shape,
+                    func=_ensure_uniform_tensor_shape,
                 ),
             ]
         )
@@ -769,13 +832,18 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
     cases = {k: sorted(v, key=lambda x: x["tp"]) for k, v in cases.items()}
 
     # NOTE: We are assuming that these keys are consistent across cases
-    target_keys = batch[0]["targets"].keys()
-    feature_keys = batch[0]["features"].keys()
-
     output = {}
     output["case_ids"] = []
-    output["targets"] = {k: [] for k in target_keys}
-    output["features"] = {k: [] for k in feature_keys}
+
+    has_features = batch[0].get("features") is not None
+    if has_features:
+        feature_keys = batch[0]["features"].keys()
+        output["features"] = {k: [] for k in feature_keys}
+
+    has_targets = batch[0].get("targets") is not None
+    if has_targets:
+        target_keys = batch[0]["targets"].keys()
+        output["targets"] = {k: [] for k in target_keys}
 
     expected_shape = _infer_expected_shape(cases)
 
@@ -787,25 +855,31 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
     # e.g. {case_1: t0, t1} -> {t0, t1}
     #      {case_2: t0}     -> {t0, <padding>}
 
-    padding_value = 0
+    padding_value = 0.0
     tp_max = max(item["tp"] for item in batch)
     seq_length = tp_max + 1  # tps are indexed from zero (t0, t1, t2, ...)
     batch_size = len(cases)
 
     # Pre-allocate output tensors
-    scans_out = torch.full((batch_size, seq_length, *expected_shape), padding_value)
-    masks_out = torch.full((batch_size, seq_length, *expected_shape), padding_value)
+    scans_out = torch.full(
+        (batch_size, seq_length, *expected_shape), padding_value, dtype=torch.float32
+    )
+    masks_out = torch.full(
+        (batch_size, seq_length, *expected_shape), padding_value, dtype=torch.int64
+    )
     is_padded_out = torch.ones(batch_size, seq_length, dtype=torch.bool)
 
     for i, (case, items) in enumerate(cases.items()):
         output["case_ids"].append(case)
 
         # NOTE: Per-case targets and features, so we can take from first available timepoint
-        for k, v in items[0]["targets"].items():
-            output["targets"][k].append(v)
+        if has_targets:
+            for k, v in items[0]["targets"].items():
+                output["targets"][k].append(v)
 
-        for k, v in items[0]["features"].items():
-            output["features"][k].append(v)
+        if has_features:
+            for k, v in items[0]["features"].items():
+                output["features"][k].append(v)
 
         # NOTE: We assume that spatial dimensions, channels, and patches are already consistent
         for item in items:
@@ -833,6 +907,10 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
         "masks": masks_out,  # (batch, tp, patch, channel, z, y, x)
         "is_padded": is_padded_out,  # (batch, tp)
     }
+
+    # Optionals - depend on Dataset configuration
+    output["targets"] = output.get("targets")
+    output["features"] = output.get("features")
 
     return output
 
@@ -869,8 +947,8 @@ def iterate_over_cases(
     for i in range(len(case_ids)):
         yield (
             case_ids[i],
-            {k: v[i] for k, v in targets.items()},
-            {k: v[i] for k, v in features.items()},
+            {k: v[i] for k, v in targets.items()} if targets is not None else None,
+            {k: v[i] for k, v in features.items()} if features is not None else None,
             scans[i],
             masks[i],
             is_padded[i],
@@ -1135,7 +1213,7 @@ if __name__ == "__main__":
     def test_dataset():
         dataset = make_dataset(dataset_cfg, preprocessing_cfg)
         logger.info(
-            f"Created dataset with {dataset.num_cases()} cases ({dataset.num_scans()} scans)"
+            f"Created dataset with {dataset.num_cases} cases ({dataset.num_scans} scans)"
         )
         logger.info(f"Cases: {dataset._cases}")
 
@@ -1196,7 +1274,7 @@ if __name__ == "__main__":
                         )
                     case _:
                         logger.info(
-                            f"{case_id}: {target}, {features}, {scan.shape, scan.dtype}, {mask.shape, mask.dtype}"
+                            f"{case_id}: {target}, {features}, {scan.shape, scan.dtype, scan.min(), scan.max(), scan.median()}, {mask.shape, mask.dtype}"
                         )
 
     # generate_folds(
