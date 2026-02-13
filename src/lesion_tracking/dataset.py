@@ -7,6 +7,7 @@ from typing import Any, Iterator, Literal, Mapping, Sequence
 
 import cc3d
 import einops
+import nibabel as nib
 import numpy as np
 import torch
 from monai.data.image_reader import NibabelReader
@@ -170,7 +171,44 @@ def sort_dict_of_lists(d: dict[str, list]) -> dict[str, list]:
     return d_sorted
 
 
-# TODO: validate NIfTI headers early (e.g., nibabel.load()) to catch corrupted files at startup
+def _validate_and_fingerprint(
+    flat_items: list[tuple], cases: list[str], dataset_path: Path
+) -> None:
+    """Validate NIfTI headers and write a fingerprint.json to the dataset root."""
+    all_shapes = []
+    all_spacings = []
+
+    for _, _, scan, mask in flat_items:
+        for nifti_path in (scan, mask):
+            if nifti_path is None:
+                continue
+            try:
+                img = nib.load(nifti_path)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load NIfTI: {nifti_path}") from e
+            # Collect shape/spacing from scans only (masks share the same grid)
+            if nifti_path is scan:
+                header = img.header
+                all_shapes.append(list(header.get_data_shape()))
+                all_spacings.append([float(s) for s in header.get_zooms()])
+
+    if not all_shapes:
+        return
+
+    fingerprint = {
+        "num_cases": len(cases),
+        "num_scans": len(all_shapes),
+        "median_shape": np.median(all_shapes, axis=0).astype(int).tolist(),
+        "median_spacing": np.round(
+            np.median(all_spacings, axis=0), decimals=4
+        ).tolist(),
+    }
+    fingerprint_path = dataset_path / "fingerprint.json"
+    with open(fingerprint_path, "w") as f:
+        json.dump(fingerprint, f, indent=2)
+    logger.info(f"Dataset fingerprint written to {fingerprint_path}")
+
+
 def scan_dataset_dir(
     path: str | Path,
     scans_dir: str = "scans",
@@ -256,6 +294,8 @@ def scan_dataset_dir(
 
     cases = sorted(cases)
     flat_items = sorted(flat_items, key=lambda x: (x[0], x[1]))
+
+    _validate_and_fingerprint(flat_items, cases, path)
 
     return flat_items, cases, metadata
 
@@ -1187,15 +1227,15 @@ if __name__ == "__main__":
     )
 
     dataset_cfg = DatasetConfig(
-        dataset_path="inputs/barts",
+        dataset_path="inputs/neov",
         task="crs",
         feature_groups=FEATURE_GROUPS["clinical_basic"],
         allow_missing_scans=True,
         allow_missing_masks=True,
     )
     preprocessing_cfg = PreprocessingConfig(
-        target_size=(96, 128, 128),
-        spacing=(5.0, 1.0, 1.0),
+        target_size=(192, 192, 96),
+        spacing=(1.0, 1.0, 5.0),
     )
 
     loader_cfg = LoaderConfig(
