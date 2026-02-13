@@ -29,6 +29,7 @@ import cc3d
 import napari
 import nibabel as nib
 import numpy as np
+import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
 
@@ -54,6 +55,150 @@ def resample_volume(
     tensor = torch.from_numpy(data).float().unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
     resampled = F.interpolate(tensor, size=target_shape, mode=mode)
     return resampled.squeeze().numpy()
+
+
+def _run_registration(
+    ref_sitk: sitk.Image,
+    mov_sitk: sitk.Image,
+    initial_transform: sitk.Transform,
+    shrink_factors: list[int],
+    smoothing_sigmas: list[float],
+    sampling_percentage: float = 0.25,
+    num_iterations: int = 500,
+    learning_rate: float = 1.0,
+    min_step: float = 1e-6,
+) -> sitk.Transform:
+    """Run one stage of registration (shared logic for rigid + affine)."""
+    reg = sitk.ImageRegistrationMethod()
+    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    reg.SetMetricSamplingStrategy(reg.RANDOM)
+    reg.SetMetricSamplingPercentage(sampling_percentage)
+
+    reg.SetInterpolator(sitk.sitkLinear)
+    reg.SetOptimizerAsRegularStepGradientDescent(
+        learningRate=learning_rate,
+        numberOfIterations=num_iterations,
+        minStep=min_step,
+        gradientMagnitudeTolerance=1e-8,
+    )
+    reg.SetOptimizerScalesFromPhysicalShift()
+
+    reg.SetShrinkFactorsPerLevel(shrink_factors)
+    reg.SetSmoothingSigmasPerLevel(smoothing_sigmas)
+    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+    reg.SetInitialTransform(initial_transform, inPlace=False)
+
+    transform = reg.Execute(ref_sitk, mov_sitk)
+    print(f"    {reg.GetOptimizerStopConditionDescription()}")
+    return transform
+
+
+def coregister_to_reference(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    spacing: tuple[float, ...] = TARGET_SPACING,
+) -> tuple[np.ndarray, sitk.Transform]:
+    """Two-stage coregistration: rigid then affine refinement.
+
+    Uses Mattes mutual information + regular-step gradient descent +
+    multi-resolution pyramid. Pads with minimum value (air).
+    """
+    ref_sitk = sitk.GetImageFromArray(reference.astype(np.float32))
+    ref_sitk.SetSpacing([float(s) for s in spacing])
+
+    mov_sitk = sitk.GetImageFromArray(moving.astype(np.float32))
+    mov_sitk.SetSpacing([float(s) for s in spacing])
+
+    fill_value = float(moving.min())
+
+    # Stage 1: rigid (6 DOF) — coarse global alignment
+    print("    Stage 1: rigid alignment...")
+    rigid_init = sitk.CenteredTransformInitializer(
+        ref_sitk,
+        mov_sitk,
+        sitk.Euler3DTransform(),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY,
+    )
+    rigid_transform = _run_registration(
+        ref_sitk,
+        mov_sitk,
+        rigid_init,
+        shrink_factors=[8, 4, 2],
+        smoothing_sigmas=[4, 2, 1],
+        sampling_percentage=0.25,
+        num_iterations=500,
+        learning_rate=1.0,
+    )
+
+    # Stage 2: affine (12 DOF) — refine with scaling/shearing
+    print("    Stage 2: affine refinement...")
+    # Unwrap CompositeTransform from Execute() to get the inner Euler3DTransform
+    if isinstance(rigid_transform, sitk.CompositeTransform):
+        rigid_inner = sitk.Euler3DTransform(rigid_transform.GetNthTransform(0))
+    else:
+        rigid_inner = sitk.Euler3DTransform(rigid_transform)
+    affine_init = sitk.AffineTransform(3)
+    affine_init.SetMatrix(rigid_inner.GetMatrix())
+    affine_init.SetTranslation(rigid_inner.GetTranslation())
+    affine_init.SetCenter(rigid_inner.GetCenter())
+    affine_transform = _run_registration(
+        ref_sitk,
+        mov_sitk,
+        affine_init,
+        shrink_factors=[4, 2, 1],
+        smoothing_sigmas=[2, 1, 0],
+        sampling_percentage=0.5,
+        num_iterations=500,
+        learning_rate=0.5,
+    )
+
+    warped = sitk.Resample(
+        mov_sitk,
+        ref_sitk,
+        affine_transform,
+        sitk.sitkLinear,
+        fill_value,
+        mov_sitk.GetPixelID(),
+    )
+    return sitk.GetArrayFromImage(warped), affine_transform
+
+
+def apply_transform(
+    data: np.ndarray,
+    transform: sitk.Transform,
+    reference_shape: tuple[int, ...],
+    spacing: tuple[float, ...] = TARGET_SPACING,
+    is_label: bool = False,
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    """Apply a SimpleITK transform to warp `data` into the reference frame.
+
+    Args:
+        data: volume to warp (array-indexed, i.e. [z, y, x] for SimpleITK)
+        transform: forward transform (moving->reference)
+        reference_shape: shape of the reference volume (array-indexed)
+        spacing: voxel spacing for both volumes
+        is_label: if True, use nearest-neighbor interpolation
+        fill_value: value for out-of-bounds voxels (default 0.0)
+    """
+    interp = sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear
+    dtype = data.dtype
+
+    img = sitk.GetImageFromArray(data.astype(np.float32))
+    img.SetSpacing([float(s) for s in spacing])
+
+    ref_img = sitk.Image([int(s) for s in reversed(reference_shape)], sitk.sitkFloat32)
+    ref_img.SetSpacing([float(s) for s in spacing])
+
+    warped = sitk.Resample(
+        img, ref_img, transform, interp, fill_value, sitk.sitkFloat32
+    )
+    result = sitk.GetArrayFromImage(warped)
+
+    if is_label:
+        result = np.round(result).astype(dtype)
+    return result
 
 
 def load_nifti_with_spacing(path: str | Path):
@@ -84,6 +229,8 @@ def load_case(dataset_path: Path, case_id: str):
         timepoints: sorted list of timepoint indices
         scans: dict tp -> np.ndarray (resampled)
         masks: dict tp -> np.ndarray | None (resampled)
+        original_spacings: dict tp -> tuple of original voxel spacings
+        original_shapes: dict tp -> tuple of original volume shapes
     """
     case_dir = dataset_path / case_id
     timepoints = discover_timepoints(case_dir, case_id)
@@ -95,12 +242,16 @@ def load_case(dataset_path: Path, case_id: str):
 
     scans = {}
     masks = {}
+    original_spacings = {}
+    original_shapes = {}
 
     for tp in timepoints:
         scan_path = case_dir / "scans" / f"{case_id}_t{tp}.nii.gz"
         mask_path = case_dir / "masks" / f"{case_id}_t{tp}.nii.gz"
 
         scan, spacing = load_nifti_with_spacing(scan_path)
+        original_spacings[tp] = spacing
+        original_shapes[tp] = scan.shape
         print(f"  t{tp}: {scan.shape} @ {spacing} mm")
         scans[tp] = resample_volume(
             scan.astype(np.float32), spacing, TARGET_SPACING, mode="trilinear"
@@ -116,7 +267,7 @@ def load_case(dataset_path: Path, case_id: str):
 
         print(f"  t{tp} resampled: {scans[tp].shape}")
 
-    return timepoints, scans, masks
+    return timepoints, scans, masks, original_spacings, original_shapes
 
 
 def soft_tissue_window(scan: np.ndarray) -> np.ndarray:
@@ -139,33 +290,76 @@ def lesion_labels_from_mask(mask: np.ndarray) -> np.ndarray:
     return cc3d.connected_components(binary).astype(np.int32)
 
 
-def get_output_path(dataset_path: Path, case_id: str) -> Path:
-    return dataset_path / case_id / TRACKING_DIR / f"{case_id}_tracking.json"
-
-
-def load_existing_annotations(path: Path):
-    """Load previously saved tracking annotations if they exist."""
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return json.load(f)
-
-
 def save_annotations(
-    path: Path,
+    tracking_dir: Path,
     case_id: str,
     timepoints: list[int],
     tracking_layers: dict[int, "napari.layers.Labels"],
     seg_masks: dict[int, np.ndarray | None],
+    transforms: dict[int, sitk.Transform] | None = None,
+    native_shapes: dict[int, tuple[int, ...]] | None = None,
+    original_spacings: dict[int, tuple[float, ...]] | None = None,
+    original_shapes: dict[int, tuple[int, ...]] | None = None,
 ):
-    """Save tracking annotations as JSON with per-timepoint info."""
-    # Compute lesion labels for each timepoint
-    lesions_per_tp = {}
-    for tp in timepoints:
-        mask = seg_masks[tp]
-        lesions_per_tp[tp] = lesion_labels_from_mask(mask) if mask is not None else None
+    """Save tracking annotations as NIfTI volumes + a JSON summary.
 
-    # Collect all tracking labels across all timepoints
+    NIfTI files are the source of truth for restoring annotations.
+    Volumes are saved in original space (original spacing + shape) so they
+    overlay directly on the raw input scans.
+
+    Pipeline per timepoint:
+        1. Undo to_axial: transpose (S,A,R) -> (R,A,S)
+        2. If coregistered (tp != t0): inverse transform -> native resampled space
+        3. Undo resampling: resample from TARGET_SPACING back to original spacing/shape
+        4. Save with original-space affine
+    """
+    tracking_dir.mkdir(parents=True, exist_ok=True)
+
+    coregistered = transforms is not None and len(transforms) > 0
+    t0 = timepoints[0]
+
+    for tp in timepoints:
+        nifti_path = tracking_dir / f"{case_id}_t{tp}_tracking.nii.gz"
+
+        # Step 1: undo to_axial (S,A,R) -> (R,A,S)
+        data = tracking_layers[tp].data.astype(np.int32)
+        data = np.transpose(data, (2, 1, 0))  # back to RAS
+
+        # Step 2: if coregistered, apply inverse transform
+        if coregistered and tp != t0 and tp in transforms:
+            inverse = transforms[tp].GetInverse()
+            data = apply_transform(
+                data,
+                inverse,
+                native_shapes[tp],
+                is_label=True,
+            )
+
+        # Step 3: undo resampling back to original spacing/shape
+        if original_spacings is not None and original_shapes is not None:
+            data = resample_volume(
+                data.astype(np.float32),
+                TARGET_SPACING,
+                original_spacings[tp],
+                mode="nearest",
+            )
+            # Crop or pad to exact original shape if rounding differs
+            orig = original_shapes[tp]
+            if data.shape != orig:
+                out = np.zeros(orig, dtype=np.int32)
+                slices = tuple(slice(0, min(d, o)) for d, o in zip(data.shape, orig))
+                out[slices] = data[slices].astype(np.int32)
+                data = out
+
+            affine = np.diag([*original_spacings[tp], 1.0])
+        else:
+            affine = np.diag([*TARGET_SPACING, 1.0])
+
+        img = nib.Nifti1Image(data.astype(np.int32), affine)
+        nib.save(img, nifti_path)
+        print(f"  Saved {nifti_path.name} (shape={data.shape})")
+
+    # Build JSON summary
     all_labels = set()
     for tp in timepoints:
         all_labels |= set(np.unique(tracking_layers[tp].data))
@@ -174,54 +368,94 @@ def save_annotations(
     correspondences = {}
     for label in sorted(all_labels):
         entry = {"tracking_id": int(label)}
-
         for tp in timepoints:
             tp_key = f"t{tp}"
             region = tracking_layers[tp].data == label
             if region.any():
-                lesions = lesions_per_tp[tp]
-                if lesions is not None:
-                    cc_ids = np.unique(lesions[region])
-                    entry[f"{tp_key}_cc_ids"] = [int(x) for x in cc_ids if x > 0]
                 mask = seg_masks[tp]
                 if mask is not None:
                     sites = np.unique(mask[region])
                     entry[f"{tp_key}_sites"] = [int(x) for x in sites if x > 0]
                 entry[f"{tp_key}_voxels"] = int(region.sum())
             else:
-                entry[f"{tp_key}_cc_ids"] = []
                 entry[f"{tp_key}_sites"] = []
                 entry[f"{tp_key}_voxels"] = 0
-
         correspondences[str(label)] = entry
 
-    output = {
+    summary = {
         "case_id": case_id,
         "timepoints": timepoints,
+        "target_spacing": list(TARGET_SPACING),
+        "coregistered": coregistered,
         "num_tracked_lesions": len(correspondences),
         "correspondences": correspondences,
     }
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"Saved tracking annotations to {path}")
+    json_path = tracking_dir / f"{case_id}_tracking.json"
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Saved tracking summary to {json_path}")
 
 
-def restore_tracking_layers(
-    annotations: dict,
+def load_tracking_volumes(
+    tracking_dir: Path,
+    case_id: str,
     timepoints: list[int],
     tracking_data: dict[int, np.ndarray],
-    lesions: dict[int, np.ndarray | None],
+    original_spacings: dict[int, tuple[float, ...]] | None = None,
+    transforms: dict[int, sitk.Transform] | None = None,
+    reference_shape: tuple[int, ...] | None = None,
 ):
-    """Restore tracking labels from a previously saved annotation file."""
-    for label_str, entry in annotations.get("correspondences", {}).items():
-        label = int(label_str)
-        for tp in timepoints:
-            tp_key = f"t{tp}"
-            if lesions[tp] is not None:
-                for cc_id in entry.get(f"{tp_key}_cc_ids", []):
-                    tracking_data[tp][lesions[tp] == cc_id] = label
+    """Restore tracking labels from previously saved NIfTI volumes.
+
+    Saved volumes are in original space. On load:
+        1. Resample from original spacing to TARGET_SPACING (nearest-neighbor)
+        2. If coregistered: apply forward transform to bring into t0 space
+        3. Apply to_axial
+    """
+    any_loaded = False
+    t0 = timepoints[0]
+
+    for tp in timepoints:
+        nifti_path = tracking_dir / f"{case_id}_t{tp}_tracking.nii.gz"
+        if not nifti_path.exists():
+            continue
+        img = nib.load(nifti_path)
+        loaded = np.asarray(img.dataobj, dtype=np.int32)
+        saved_spacing = tuple(float(s) for s in img.header.get_zooms()[:3])
+
+        # Step 1: resample from saved spacing to TARGET_SPACING
+        if original_spacings is not None:
+            loaded = resample_volume(
+                loaded.astype(np.float32),
+                saved_spacing,
+                TARGET_SPACING,
+                mode="nearest",
+            ).astype(np.int32)
+
+        # Step 2: if coregistered, apply forward transform to bring into t0 space
+        if transforms is not None and tp != t0 and tp in transforms:
+            loaded = apply_transform(
+                loaded,
+                transforms[tp],
+                reference_shape,
+                is_label=True,
+            )
+
+        # Step 3: apply to_axial
+        loaded = to_axial(loaded)
+
+        if loaded.shape == tracking_data[tp].shape:
+            tracking_data[tp][:] = loaded
+            any_loaded = True
+            n_labels = len(set(np.unique(loaded)) - {0})
+            print(f"  Restored t{tp}: {n_labels} tracking labels")
+        else:
+            print(
+                f"  Warning: shape mismatch for t{tp} "
+                f"(loaded {loaded.shape} vs expected {tracking_data[tp].shape}), skipping"
+            )
+    return any_loaded
 
 
 def main():
@@ -233,13 +467,44 @@ def main():
         default=DEFAULT_DATASET,
         help=f"Dataset path (default: {DEFAULT_DATASET})",
     )
+    parser.add_argument(
+        "--coregister",
+        action="store_true",
+        help="Rigid-register all timepoints to t0 for aligned annotation",
+    )
     args = parser.parse_args()
 
     case_id = args.case_id
     dataset_path = args.dataset
+    do_coregister = args.coregister
 
     print(f"Loading {case_id} from {dataset_path}...")
-    timepoints, scans, masks = load_case(dataset_path, case_id)
+    timepoints, scans, masks, original_spacings, original_shapes = load_case(
+        dataset_path, case_id
+    )
+
+    # Optional coregistration to t0
+    transforms = {}  # tp -> sitk.Transform (forward: moving -> t0 space)
+    native_shapes = {}  # tp -> shape at TARGET_SPACING before coregistration
+    if do_coregister:
+        t0 = timepoints[0]
+        print(f"Coregistering all timepoints to t{t0}...")
+        for tp in timepoints:
+            native_shapes[tp] = scans[tp].shape
+            if tp == t0:
+                continue
+            print(f"  Registering t{tp} -> t{t0}...")
+            warped_scan, transform = coregister_to_reference(scans[t0], scans[tp])
+            transforms[tp] = transform
+            scans[tp] = warped_scan
+            if masks[tp] is not None:
+                masks[tp] = apply_transform(
+                    masks[tp],
+                    transform,
+                    scans[t0].shape,
+                    is_label=True,
+                )
+        print("  Coregistration complete.")
 
     # Prepare per-timepoint data (all transposed to axial)
     displays = {}
@@ -260,11 +525,19 @@ def main():
         print(f"  t{tp}: {n} lesions")
 
     # Restore previous annotations if they exist
-    output_path = get_output_path(dataset_path, case_id)
-    existing = load_existing_annotations(output_path)
-    if existing is not None:
-        print(f"Restoring previous annotations from {output_path}")
-        restore_tracking_layers(existing, timepoints, tracking_data, lesions)
+    tracking_dir = dataset_path / case_id / TRACKING_DIR
+    if tracking_dir.exists():
+        print(f"Restoring annotations from {tracking_dir}")
+        t0 = timepoints[0]
+        load_tracking_volumes(
+            tracking_dir,
+            case_id,
+            timepoints,
+            tracking_data,
+            original_spacings=original_spacings,
+            transforms=transforms if do_coregister else None,
+            reference_shape=scans[t0].shape if do_coregister else None,
+        )
 
     # --- Build napari viewer ---
     viewer = napari.Viewer(title=f"Lesion Tracking - {case_id}")
@@ -457,7 +730,17 @@ def main():
     @viewer.bind_key("Shift-S")
     def _save(viewer):
         """Save tracking annotations."""
-        save_annotations(output_path, case_id, timepoints, tracking_layers, masks)
+        save_annotations(
+            tracking_dir,
+            case_id,
+            timepoints,
+            tracking_layers,
+            masks,
+            transforms=transforms if do_coregister else None,
+            native_shapes=native_shapes if do_coregister else None,
+            original_spacings=original_spacings,
+            original_shapes=original_shapes,
+        )
 
     @viewer.bind_key("Shift-A")
     def _auto_init(viewer):
