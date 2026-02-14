@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import einops
 import lightning as L
@@ -79,7 +79,9 @@ def pca_project_to_rgb(features: torch.Tensor) -> torch.Tensor:
     return (projected - mins) / (maxs - mins + 1e-8)
 
 
-def split_global_and_local_features(inputs_shape, patch_size, hidden_size, outputs):
+def split_global_and_local_features(
+    inputs_shape: tuple, patch_size: int, hidden_size: int, outputs: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Split ViT output into a global CLS token and spatially-arranged patch features.
     NOTE: inputs_shape should probably come from the BatchFeatures returned by transformers.AutoImageProcessor
@@ -103,7 +105,7 @@ def split_global_and_local_features(inputs_shape, patch_size, hidden_size, outpu
     num_patches_flat = num_patches_height * num_patches_width
 
     # shape: (batch, num_patches + 1, hidden_size)
-    last_hidden_states = outputs[0]
+    last_hidden_states: torch.Tensor = outputs[0]
 
     assert last_hidden_states.shape == (
         batch_size,
@@ -112,10 +114,10 @@ def split_global_and_local_features(inputs_shape, patch_size, hidden_size, outpu
     )
 
     # shape: (batch, hidden_size)
-    cls_token = last_hidden_states[:, 0, :]
+    cls_token: torch.Tensor = last_hidden_states[:, 0, :]
 
     # shape: (batch, num_patches_height, num_patches_width, hidden_size)
-    patch_features = last_hidden_states[:, 1:, :].unflatten(
+    patch_features: torch.Tensor = last_hidden_states[:, 1:, :].unflatten(
         1, (num_patches_height, num_patches_width)
     )
     return cls_token, patch_features
@@ -148,7 +150,7 @@ class SliceBasedVolumeEncoder(nn.Module):
     def hidden_size(self):
         return self.model.config.hidden_size
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Note: Assumes C = 1
 
@@ -157,7 +159,13 @@ class SliceBasedVolumeEncoder(nn.Module):
         C - Channels
         XYZ - Spatial dims
 
-        Output:
+        Output: cls_token, patch_features
+        H - Hidden size = embedding size
+        N1 - Num. patches height
+        N2 - Num. patches width
+
+        cls_token: (B, Z, H)
+        patch_features: (B, Z, N1, N2, H)
         """
         batch_size = inputs.shape[0]
         inputs = volume_to_rgb_slices(inputs)  # (B, Z, 3, X, Y)
@@ -211,7 +219,7 @@ class SliceBasedVolumeEncoder(nn.Module):
         #     logits = self.classifier(pooled_features)
         # return logits, attention_weights, pooled_features
 
-        return inputs
+        return cls_token, patch_features
 
 
 class SliceBasedViTEncoder(L.LightningModule):
@@ -791,8 +799,9 @@ def test_model_encoder_forward():
         inputs = inputs[:, 0, 0]  # (B, C, X, Y, Z) with C=1
 
         logger.info(f"inputs: {inputs.shape, inputs.dtype}")
-        outputs = encoder.forward(inputs)
-        logger.info(f"outputs: {outputs.shape, outputs.dtype}")
+        cls_token, patch_features = encoder.forward(inputs)
+        logger.info(f"cls_token: {cls_token.shape, cls_token.dtype}")
+        logger.info(f"patch_features: {patch_features.shape, patch_features.dtype}")
         return
 
 
