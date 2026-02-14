@@ -9,15 +9,18 @@ import lightning as L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from IPython.core.debugger import set_trace
 from torchmetrics.classification import BinaryAccuracy, BinaryAUROC
 from transformers import (
     AutoImageProcessor,
     AutoModel,
+    BatchFeature,
 )
 
 from lesion_tracking.logger import get_logger
 
 logger = get_logger(__name__)
+logger.setLevel("DEBUG")
 
 # Device will be obtained from config when needed
 
@@ -60,6 +63,64 @@ def volume_to_rgb_slices(inputs: torch.Tensor) -> torch.Tensor:
     return einops.rearrange(inputs, "b x y z rgb -> b z rgb x y")
 
 
+def pca_project_to_rgb(features: torch.Tensor) -> torch.Tensor:
+    """
+    Project high-dimensional feature vectors to 3D via PCA, then normalize to [0, 1].
+
+    Input:  (N, D) — N feature vectors of dimension D.
+    Output: (N, 3) — pseudo-RGB values in [0, 1].
+    """
+    centered = features - features.mean(dim=0, keepdim=True)
+    U, S, V = torch.pca_lowrank(centered, q=3)
+    projected = centered @ V[:, :3]  # (N, 3)
+    # normalize each channel independently to [0, 1]
+    mins = projected.min(dim=0, keepdim=True).values
+    maxs = projected.max(dim=0, keepdim=True).values
+    return (projected - mins) / (maxs - mins + 1e-8)
+
+
+def split_global_and_local_features(inputs_shape, patch_size, hidden_size, outputs):
+    """
+    Split ViT output into a global CLS token and spatially-arranged patch features.
+    NOTE: inputs_shape should probably come from the BatchFeatures returned by transformers.AutoImageProcessor
+
+    Args:
+        inputs_shape: (B, 3, H, W) — shape of the images fed to the ViT.
+        patch_size:   side length of each square patch (pixels).
+        hidden_size:  embedding dimension of the ViT.
+        outputs:      ViT output tuple; outputs[0] is last_hidden_state
+                      of shape (B, 1 + num_patches, hidden_size).
+
+    Returns:
+        cls_token:      (B, hidden_size)
+        patch_features: (B, H // patch_size, W // patch_size, hidden_size)
+    """
+    batch_size, rgb, img_height, img_width = inputs_shape
+    num_patches_height, num_patches_width = (
+        img_height // patch_size,
+        img_width // patch_size,
+    )
+    num_patches_flat = num_patches_height * num_patches_width
+
+    # shape: (batch, num_patches + 1, hidden_size)
+    last_hidden_states = outputs[0]
+
+    assert last_hidden_states.shape == (
+        batch_size,
+        1 + num_patches_flat,
+        hidden_size,
+    )
+
+    # shape: (batch, hidden_size)
+    cls_token = last_hidden_states[:, 0, :]
+
+    # shape: (batch, num_patches_height, num_patches_width, hidden_size)
+    patch_features = last_hidden_states[:, 1:, :].unflatten(
+        1, (num_patches_height, num_patches_width)
+    )
+    return cls_token, patch_features
+
+
 class SliceBasedVolumeEncoder(nn.Module):
     """
     Takes a 3D volume and encodes it by
@@ -77,12 +138,14 @@ class SliceBasedVolumeEncoder(nn.Module):
         if not model_path:
             raise ValueError(f"Invalid feature extractor: {self.config['vit_encoder']}")
 
-        self.processor = AutoImageProcessor.from_pretrained(model_path)
-        self.model = AutoModel.from_pretrained(model_path, add_pooling_layer=False)
+        self.processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
+        self.model = AutoModel.from_pretrained(
+            model_path
+        )  # FIXME: google family needs add_pooling_layer=False
         self.pooling = None
 
     @property
-    def embedding_dim(self):
+    def hidden_size(self):
         return self.model.config.hidden_size
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -96,7 +159,37 @@ class SliceBasedVolumeEncoder(nn.Module):
 
         Output:
         """
+        batch_size = inputs.shape[0]
         inputs = volume_to_rgb_slices(inputs)  # (B, Z, 3, X, Y)
+        inputs = einops.rearrange(inputs, "b z rgb x y -> (b z) rgb x y")
+        logger.debug(f"inputs to processor: {inputs.shape, inputs.dtype}")
+        processed: BatchFeature = self.processor(
+            inputs, do_rescale=False, return_tensors="pt"
+        )
+        logger.debug(
+            f"processed: {type(processed)} "
+            f"processed: { {k: (v.shape, v.dtype) for k, v in processed.items()} }"
+        )
+        outputs = self.model(**processed)
+        # cls_token: (batch_size * z), hidden_size
+        # patch_features: (batch_size * z), num_patches_height, num_patches_width, hidden_size
+        cls_token, patch_features = split_global_and_local_features(
+            inputs_shape=processed.pixel_values.shape,
+            patch_size=self.model.config.patch_size,
+            hidden_size=self.model.config.hidden_size,
+            outputs=outputs,
+        )
+
+        logger.debug(f"cls_token: {cls_token.shape, cls_token.dtype}")
+        logger.debug(f"patch_features: {patch_features.shape, patch_features.dtype}")
+        logger.debug("restoring batch_size...")
+
+        cls_token = einops.rearrange(cls_token, "(b z) h -> b z h", b=batch_size)
+        patch_features = einops.rearrange(
+            patch_features, "(b z) n1 n2 h -> b z n1 n2 h", b=batch_size
+        )
+        logger.debug(f"cls_token: {cls_token.shape, cls_token.dtype}")
+        logger.debug(f"patch_features: {patch_features.shape, patch_features.dtype}")
 
         # batch_size, _, height, width, num_slices = images.shape
         # # Rearrange and flatten slices for feature extraction
@@ -552,8 +645,161 @@ def test_volume_to_rgb_slices():
         return
 
 
+def test_split_global_and_local_features():
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from lesion_tracking.config import (
+        Config,
+        DatasetConfig,
+        LoaderConfig,
+        PreprocessingConfig,
+        make_loader,
+    )
+    from lesion_tracking.dataset import iterate_over_cases
+
+    cfg = Config(
+        dataset=DatasetConfig(
+            dataset_path="inputs/neov",
+            enable_augmentations=False,
+        ),
+        preprocessing=PreprocessingConfig(
+            normalization="soft_tissue",
+            target_size=(38, 38, 24),
+            spacing=(5.0, 5.0, 20.0),
+        ),
+        loader=LoaderConfig(cases_per_batch=1, num_workers=0),
+    )
+
+    loader = make_loader(cfg)
+
+    vit_key = "dinov2-small"
+    model_path = VIT_ENCODERS[vit_key]
+    processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
+    model = AutoModel.from_pretrained(model_path)
+    model.eval()
+    patch_size = model.config.patch_size
+    hidden_size = model.config.hidden_size
+
+    for batch in loader:
+        for case_id, _, _, scans, masks, is_padded in iterate_over_cases(batch):
+            tp = next(i for i in range(len(is_padded)) if not is_padded[i])
+            vol = scans[tp]  # (N, C, X, Y, Z) with N=1, C=1
+            logger.info(f"[{case_id} t{tp}] input: {vol.shape}")
+
+            rgb_slices = volume_to_rgb_slices(vol)  # (1, Z, 3, X, Y)
+            flat_slices = einops.rearrange(rgb_slices, "b z rgb x y -> (b z) rgb x y")
+
+            processed: BatchFeature = processor(
+                flat_slices, do_rescale=False, return_tensors="pt"
+            )
+            pixel_values = processed.pixel_values  # (Z, 3, H_proc, W_proc)
+
+            with torch.no_grad():
+                outputs = model(**processed)
+
+            cls_token, patch_features = split_global_and_local_features(
+                inputs_shape=pixel_values.shape,
+                patch_size=patch_size,
+                hidden_size=hidden_size,
+                outputs=outputs,
+            )
+            # cls_token: (Z, hidden_size)
+            # patch_features: (Z, ph, pw, hidden_size)
+            logger.info(
+                f"cls_token: {cls_token.shape}, patch_features: {patch_features.shape}"
+            )
+
+            num_z = pixel_values.shape[0]
+            ph, pw = patch_features.shape[1], patch_features.shape[2]
+            proc_h, proc_w = pixel_values.shape[2], pixel_values.shape[3]
+
+            # PCA across all patches of all slices
+            all_patches = patch_features.reshape(-1, hidden_size)  # (Z*ph*pw, D)
+            pca_rgb = pca_project_to_rgb(all_patches).numpy()  # (Z*ph*pw, 3)
+            pca_rgb = pca_rgb.reshape(num_z, ph, pw, 3)
+
+            n_show = min(5, num_z)
+            indices = np.linspace(0, num_z - 1, n_show, dtype=int)
+
+            # 2 columns: RGB image | greyscale + PCA overlay
+            canvas = np.zeros((n_show * proc_w, 2 * proc_h, 3))
+            for row, zi in enumerate(indices):
+                img = pixel_values[zi].numpy().transpose(1, 2, 0)  # (H, W, 3)
+                img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                rgb = np.transpose(img, (1, 0, 2))  # (W, H, 3)
+
+                grey = np.mean(rgb, axis=2)  # (W, H)
+                pca_slice = pca_rgb[zi]  # (ph, pw, 3)
+                pca_upsampled = np.array(
+                    [
+                        np.kron(pca_slice[:, :, c], np.ones((patch_size, patch_size)))
+                        for c in range(3)
+                    ]
+                ).transpose(1, 2, 0)  # (H, W, 3) -> transpose to (W, H, 3)
+                pca_upsampled = np.transpose(pca_upsampled, (1, 0, 2))
+                overlay = np.clip(0.5 * grey[..., None] + 0.5 * pca_upsampled, 0, 1)
+
+                y0 = row * proc_w
+                canvas[y0 : y0 + proc_w, :proc_h] = rgb
+                canvas[y0 : y0 + proc_w, proc_h : 2 * proc_h] = overlay
+
+            fig, ax = plt.subplots(1, 1, figsize=(6, 3 * n_show))
+            ax.imshow(canvas, origin="lower", aspect="equal")
+            ax.set_axis_off()
+            fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            plt.show()
+            return
+        return
+
+
+def test_model_encoder_forward():
+    from lesion_tracking.config import (
+        Config,
+        DatasetConfig,
+        LoaderConfig,
+        PreprocessingConfig,
+        make_loader,
+    )
+
+    cfg = Config(
+        dataset=DatasetConfig(
+            dataset_path="inputs/neov",
+            enable_augmentations=False,
+        ),
+        preprocessing=PreprocessingConfig(
+            normalization="soft_tissue",
+            target_size=(38, 38, 24),
+            spacing=(5.0, 5.0, 20.0),
+        ),
+        loader=LoaderConfig(cases_per_batch=1, num_workers=0),
+    )
+
+    loader = make_loader(cfg)
+    encoder = SliceBasedVolumeEncoder(config={"vit_encoder": "dinov2-small"})
+
+    for batch in loader:
+        logger.info("Loaded batch...")
+        inputs = batch.get("imaging")
+        if any(inputs.get("is_padded").flatten().tolist()):
+            logger.warning(
+                f"Skipping batch. Reason: has padded inputs {inputs.get('is_padded').flatten().tolist()}"
+            )
+            continue
+        inputs = inputs.get("scans")
+        # Take the first timepoint (assume N = 1)
+        inputs = inputs[:, 0, 0]  # (B, C, X, Y, Z) with C=1
+
+        logger.info(f"inputs: {inputs.shape, inputs.dtype}")
+        outputs = encoder.forward(inputs)
+        logger.info(f"outputs: {outputs.shape, outputs.dtype}")
+        return
+
+
 def main():
-    test_volume_to_rgb_slices()
+    # test_volume_to_rgb_slices()
+    # test_split_global_and_local_features()
+    test_model_encoder_forward()
 
 
 if __name__ == "__main__":
