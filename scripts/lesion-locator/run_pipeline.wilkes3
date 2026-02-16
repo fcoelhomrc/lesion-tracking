@@ -60,8 +60,14 @@ case "$CONFIG" in
     *) echo "Error: config must be point, box, prev_mask, or all (got: $CONFIG)"; exit 1 ;;
 esac
 
-#! Work directory
+#! Work directory (project root, where pyproject.toml lives)
 workdir="$SLURM_SUBMIT_DIR"
+SCRIPTS_DIR="$workdir/scripts/lesion-locator"
+
+###############################################################
+### You should not have to change anything below this line ####
+###############################################################
+
 cd $workdir
 echo -e "Changed directory to `pwd`.\n"
 
@@ -83,13 +89,11 @@ echo ""
 if [ "$SLURM_JOB_NODELIST" ]; then
     export NODEFILE=`generate_pbs_nodefile`
     cat $NODEFILE | uniq > machine.file.$JOBID
-    echo -e "Nodes allocated:\n================"
+    echo -e "\nNodes allocated:\n================"
     echo `cat machine.file.$JOBID | sed -e 's/\..*$//g'`
 fi
 
 echo -e "\nnumtasks=$numtasks, numnodes=$numnodes, mpi_tasks_per_node=$mpi_tasks_per_node (OMP_NUM_THREADS=$OMP_NUM_THREADS)\n"
-
-SCRIPTS_DIR="$(dirname "$0")"
 
 set -e  # Exit on first error
 
