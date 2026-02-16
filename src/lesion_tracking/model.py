@@ -222,6 +222,140 @@ class SliceBasedVolumeEncoder(nn.Module):
         return cls_token, patch_features
 
 
+def build_rope_frequencies(
+    dim: int, max_len: int = 4096, theta: float = 10000.0
+) -> torch.Tensor:
+    """
+    Precompute RoPE complex exponential frequencies.
+
+    Output: (max_len, D // 2) complex
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    positions = torch.arange(max_len).float()
+    angles = torch.outer(positions, freqs)  # (max_len, dim // 2)
+    return torch.polar(torch.ones_like(angles), angles)
+
+
+def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """
+    Apply rotary position embeddings to a tensor.
+
+    S - Sequence length
+    D - Positional encoding dim
+
+    Input:  (..., S, D) — D must be even
+    Output: (..., S, D)
+    """
+    seq_len = x.shape[-2]
+    freqs = freqs[:seq_len].to(x.device)
+    x_paired = einops.rearrange(x.float(), "... s (d two) -> ... s d two", two=2)
+    x_complex = torch.view_as_complex(x_paired)
+    x_rotated = torch.view_as_real(x_complex * freqs)
+    return einops.rearrange(x_rotated, "... s d two -> ... s (d two)").to(x.dtype)
+
+
+class AttentionBasedPooling(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        dropout: float = 0.1,
+        return_attention: bool = False,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
+    ):
+        super().__init__()
+        self.return_attention = return_attention
+        self.norm = nn.LayerNorm(hidden_size)
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = math.sqrt(hidden_size)
+
+        self.use_rope = use_rope
+        if use_rope:
+            assert hidden_size % 2 == 0, "RoPE requires even hidden_size"
+            self.register_buffer(
+                "rope_freqs",
+                build_rope_frequencies(hidden_size, theta=rope_theta),
+                persistent=False,
+            )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        return_attention: bool | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Input:
+        inputs: (B, Z, H)
+        attn_mask: (B, Z) bool indicating True = valid, False = padded
+
+        Output:
+        pooled: (B, H)
+        attn_weights: (B, Z, Z) if returning attention
+        """
+        want_attention = (
+            return_attention if return_attention is not None else self.return_attention
+        )
+
+        x = self.norm(inputs)
+
+        Q = self.query(x)
+        K = self.key(x)
+        V = self.value(x)
+
+        # NOTE: Optionally, use relative positional encoding scheme to capture z-axis spatial relationships
+        # I think relative PE makes more sense, because a fixed slice z might capture different anatomical regions,
+        # depending on (i) scan original shape, and (ii) scan original spacing.
+        if self.use_rope:
+            Q = apply_rope(Q, self.rope_freqs)
+            K = apply_rope(K, self.rope_freqs)
+
+        # (B, Z) -> (B, 1, 1, Z) additive mask for attention logits
+        if attn_mask is not None:
+            additive_mask = einops.rearrange(
+                torch.where(attn_mask, 0.0, float("-inf")),
+                "b z -> b 1 1 z",
+            )
+        else:
+            additive_mask = None
+
+        if not want_attention:
+            pooled = F.scaled_dot_product_attention(
+                Q,
+                K,
+                V,
+                attn_mask=additive_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+            return self._masked_mean_pool(pooled, attn_mask)
+
+        # Batched matmul - Q @ K^T
+        scores = einops.einsum(Q, K, "b i k, b j k -> b i j") / self.scale
+        if additive_mask is not None:
+            scores = scores + additive_mask
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        # Batched matmul - attn_weights @ V
+        pooled = einops.einsum(attn_weights, V, "b i j, b j k -> b i k")
+        return self._masked_mean_pool(pooled, attn_mask), attn_weights
+
+    @staticmethod
+    def _masked_mean_pool(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        """
+        Input:
+            x: (B, Z, H),
+            mask: (B, Z) bool or None
+        Output: (B, H)
+        """
+        if mask is not None:
+            x = x * einops.rearrange(mask, "b z -> b z 1")
+            return x.sum(dim=1) / einops.rearrange(mask.sum(dim=1), "b -> b 1")
+        return x.mean(dim=1)
+
+
 class SliceBasedViTEncoder(L.LightningModule):
     def __init__(self, config: dict):
         super().__init__()
