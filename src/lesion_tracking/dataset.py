@@ -109,8 +109,8 @@ CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
 #
 # In every case, we have exactly 1 dimension to iterate over:
 #
-# 2D approach - Input: (C, Z, Y, X) -> iterate over Z
-# 2.5D approach - Input: (C, Z, Y, X) -> iterate over Z:Z+K with stride of K
+# 2D approach - Input: (C, X, Y, Z) -> iterate over Z
+# 2.5D approach - Input: (C, X, Y, Z) -> iterate over Z:Z+K with stride of K
 # 3D approach - Input: (N, C, Z', Y', X') -> iterate over N sampled patches
 #
 # Should this logic be baked in the Dataset object?
@@ -122,16 +122,16 @@ CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
 #
 # Assumption: preprocessing will homogenize spatial dimensions
 # -> We can stack the scans belonging to the same sequence
-# e.g. 2D approach - Input: (L, C, Z, Y, X)
-# e.g. 2.5D approach - Input: (L, C, Z, Y, X)
+# e.g. 2D approach - Input: (L, C, X, Y, Z)
+# e.g. 2.5D approach - Input: (L, C, X, Y, Z)
 # e.g. 3D approach - Input: (L, N, C, Z', Y', X')
 #
 # Batching - Group B cases together
 #
 # Assumption: L is consistent *across cases* - Does not hold.
 # Strategy: Padding + Attention Mask (if applicable)
-# e.g. 2D approach - Input: (B, L, C, Z, Y, X)
-# e.g. 2.5D approach - Input: (B, L, C, Z, Y, X)
+# e.g. 2D approach - Input: (B, L, C, X, Y, Z)
+# e.g. 2.5D approach - Input: (B, L, C, X, Y, Z)
 # e.g. 3D approach - Input: (B, L, N, C, Z', Y', X')
 #
 # Assumption: Z is consistent *across images* and/or *across cases* - Does not hold.
@@ -431,10 +431,10 @@ class LongitudinalDataset(Dataset):
 
         self._enable_augmentations = enable_augmentations
 
-        self._prepare_full_pipeline()
-        self._prepare_dataset()
+        self._build_full_pipeline()
+        self._build_dataset()
 
-    def _prepare_dataset(self):
+    def _build_dataset(self):
         flat_items, cases, metadata = scan_dataset_dir(
             self._dataset_path,
             scans_dir=self._scans_dir,
@@ -570,7 +570,7 @@ class LongitudinalDataset(Dataset):
             "mask": data.get("mask"),
         }
 
-    def _prepare_loader(self):
+    def _build_loader(self):
         """
         Prepares a MONAI pipeline to perform:
 
@@ -611,7 +611,7 @@ class LongitudinalDataset(Dataset):
 
         self._loading_pipeline = Compose(pipeline)
 
-    def _prepare_augmentations(self):
+    def _build_augmentations(self):
         spatial_keys = ["scan", "mask"]
         self._augmentation_pipeline = Compose(
             [
@@ -671,11 +671,11 @@ class LongitudinalDataset(Dataset):
             ]
         )
 
-    def _prepare_full_pipeline(self):
+    def _build_full_pipeline(self):
         full_pipeline = []
 
         # Deterministic transforms - can be cached
-        self._prepare_loader()
+        self._build_loader()
         full_pipeline.extend([self._loading_pipeline])
 
         # Volume handling strategy
@@ -734,7 +734,7 @@ class LongitudinalDataset(Dataset):
 
         # Random augmentations - computed at runtime
         if self._enable_augmentations:
-            self._prepare_augmentations()
+            self._build_augmentations()
             full_pipeline.extend([self._augmentation_pipeline])
 
         full_pipeline.extend(
@@ -748,7 +748,7 @@ class LongitudinalDataset(Dataset):
                 ),
                 # NOTE: When we do transforms like random cropping, we get a list of patches
                 #       To keep shapes consistent, we add dummy dimension if no patching is used
-                #       i.e. output shape should always be (patch, channel, z, y, x)
+                #       i.e. output shape should always be (patch, channel, x, y, z)
                 Lambdad(
                     keys=["scan", "mask"],
                     func=_ensure_uniform_tensor_shape,
@@ -859,7 +859,7 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
     'case_ids' -> list[str]
     'targets' -> dict[torch.Tensor]  (shape: B) e.g. {'crs': int} or {'event': int, 'time_survival': float}
     'features' -> dict[torch.Tensor] (shape: B, M) e.g. {'clinical': *, 'genomics': *},
-    'imaging' -> dict[torch.Tensor] (shape: B, L, N, C, Z, Y, X | B, L) e.g. {'scans': *, 'masks': *, 'is_padded': bool}
+    'imaging' -> dict[torch.Tensor] (shape: B, L, N, C, X, Y, Z | B, L) e.g. {'scans': *, 'masks': *, 'is_padded': bool}
     """
     # Map: case_id -> list[item] where each item is item[case_id, tp, target, features, scan, mask]
     # i.e.  this groups together all timepoints available for the case_id
@@ -943,8 +943,8 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
                 is_padded_out[i, tp] = False
 
     output["imaging"] = {
-        "scans": scans_out,  # (batch, tp, patch, channel, z, y, x)
-        "masks": masks_out,  # (batch, tp, patch, channel, z, y, x)
+        "scans": scans_out,  # (batch, tp, patch, channel, x, y, z)
+        "masks": masks_out,  # (batch, tp, patch, channel, x, y, z)
         "is_padded": is_padded_out,  # (batch, tp)
     }
 
@@ -964,15 +964,15 @@ def iterate_over_cases(
     'case_ids' -> list[str]
     'targets' -> dict[torch.Tensor]  (shape: B) e.g. {'crs': int} or {'event': int, 'time_survival': float}
     'features' -> dict[torch.Tensor] (shape: B, M) e.g. {'clinical': *, 'genomics': *},
-    'imaging' -> dict[torch.Tensor] (shape: B, L, N, C, Z, Y, X | B, L) e.g. {'scans': *, 'masks': *, 'is_padded': bool}
+    'imaging' -> dict[torch.Tensor] (shape: B, L, N, C, X, Y, Z | B, L) e.g. {'scans': *, 'masks': *, 'is_padded': bool}
 
     Output:
 
     case_id -> str,
     targets -> {key: int/float},
     features -> {key: torch.Tensor (shape: M, )},
-    scans -> torch.Tensor (shape: L, N, C, Z, Y, X),
-    masks -> torch.Tensor (shape: L, N, C, Z, Y, X),
+    scans -> torch.Tensor (shape: L, N, C, X, Y, Z),
+    masks -> torch.Tensor (shape: L, N, C, X, Y, Z),
     is_padded -> torch.Tensor (shape: L, ),
     """
 
@@ -1006,11 +1006,10 @@ def iterate_over_timepoints(
     case_id -> str,
     targets -> {key: int/float},
     features -> {key: torch.Tensor (shape: M, )},
-    scans -> torch.Tensor (shape: N, C, Z, Y, X),
-    masks -> torch.Tensor (shape:  N, C, Z, Y, X),
+    scans -> torch.Tensor (shape: N, C, X, Y, Z),
+    masks -> torch.Tensor (shape:  N, C, X, Y, Z),
     is_padded -> bool,
     """
-    # FIXME: this is broken, need to check logic
 
     for case_id, targets, features, scans, masks, is_padded in iterate_over_cases(
         batch
