@@ -272,7 +272,7 @@ class AttentionBasedPooling(nn.Module):
         rope_theta: float,
     ):
         super().__init__()
-        self.return_attention = return_attention
+        self._return_attention = return_attention
         self.norm = nn.LayerNorm(hidden_size)
         self.query = nn.Linear(hidden_size, hidden_size)
         self.key = nn.Linear(hidden_size, hidden_size)
@@ -288,6 +288,10 @@ class AttentionBasedPooling(nn.Module):
                 build_rope_frequencies(hidden_size, theta=rope_theta),
                 persistent=False,
             )
+
+    @property
+    def return_attention(self):
+        return self._return_attention
 
     def forward(
         self,
@@ -364,7 +368,7 @@ class AttentionBasedPooling(nn.Module):
         return x.mean(dim=1)
 
 
-class SliceBasedViTEncoder(L.LightningModule):
+class ClassificationModule(L.LightningModule):
     def __init__(
         self,
         backbone: str,
@@ -388,8 +392,20 @@ class SliceBasedViTEncoder(L.LightningModule):
         self.val_auroc = BinaryAUROC()
         self.val_acc = BinaryAccuracy()
 
-    def forward(self, images, clinical_features):
-        return self.model(images, clinical_features)
+    def forward(
+        self,
+        images,
+        attn_mask: torch.Tensor | None = None,
+        clinical_features: bool | None = None,
+    ):
+        cls_token, _ = self.encoder(images)
+
+        if self.pooling.return_attention:
+            volume_features, attn_scores = self.pooling(cls_token, attn_mask=attn_mask)
+            return volume_features, attn_scores
+        else:
+            volume_features = self.pooling(cls_token, attn_mask=attn_mask)
+            return volume_features
 
     def _shared_step(self, batch):
         images = batch["scan"]
@@ -642,7 +658,10 @@ def test_model_encoder_forward():
     )
 
     loader = make_loader(cfg)
-    encoder = SliceBasedVolumeEncoder(backbone="dinov2-small")
+    encoder = ClassificationModule(
+        backbone="dinov2-small",
+        pooling=PoolingConfig(return_attention=True),
+    )
 
     for batch in loader:
         logger.info("Loaded batch...")
@@ -657,9 +676,8 @@ def test_model_encoder_forward():
         inputs = inputs[:, 0, 0]  # (B, C, X, Y, Z) with C=1
 
         logger.info(f"inputs: {inputs.shape, inputs.dtype}")
-        cls_token, patch_features = encoder.forward(inputs)
-        logger.info(f"cls_token: {cls_token.shape, cls_token.dtype}")
-        logger.info(f"patch_features: {patch_features.shape, patch_features.dtype}")
+        volume_features, attn_weights = encoder.forward(inputs)
+        set_trace()
         return
 
 
