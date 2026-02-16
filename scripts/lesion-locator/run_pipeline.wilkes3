@@ -1,0 +1,152 @@
+#!/bin/bash
+#!
+#! LesionLocator evaluation pipeline on Wilkes3 (A100)
+#! Runs: prepare_data -> segment -> track -> compute_metrics -> analyze_metrics
+#!
+#! Usage: sbatch run_pipeline.wilkes3 /path/to/LesionLocatorCheckpoint [neov|barts|all] [segment|track|all] [point|box|prev_mask|all]
+#!
+
+#!#############################################################
+#!#### Modify the options in this section as appropriate ######
+#!#############################################################
+
+#SBATCH -J lesionlocator
+#SBATCH -A CRISPIN-ORTUZAR-SL2-GPU
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --time=12:00:00
+#SBATCH --mail-type=ALL
+#SBATCH -p ampere
+
+#! Number of nodes and tasks per node allocated by SLURM (do not change):
+numnodes=$SLURM_JOB_NUM_NODES
+numtasks=$SLURM_NTASKS
+mpi_tasks_per_node=$(echo "$SLURM_TASKS_PER_NODE" | sed -e  's/^\([0-9][0-9]*\).*$/\1/')
+
+#! Environment setup
+. /etc/profile.d/modules.sh
+module purge
+module load rhel8/default-amp
+
+export OMP_NUM_THREADS=1
+
+#! Parse arguments
+CHECKPOINT="${1:?Error: checkpoint path required as first argument}"
+DATASET="${2:-neov}"
+MODE="${3:-all}"
+CONFIG="${4:-all}"
+
+#! Validate arguments
+if [[ ! -d "$CHECKPOINT" ]]; then
+    echo "Error: Checkpoint directory not found: $CHECKPOINT"
+    exit 1
+fi
+
+case "$DATASET" in
+    neov|barts|all) ;;
+    *) echo "Error: dataset must be neov, barts, or all (got: $DATASET)"; exit 1 ;;
+esac
+
+case "$MODE" in
+    segment|track|all) ;;
+    *) echo "Error: mode must be segment, track, or all (got: $MODE)"; exit 1 ;;
+esac
+
+case "$CONFIG" in
+    point|box|prev_mask|all) ;;
+    *) echo "Error: config must be point, box, prev_mask, or all (got: $CONFIG)"; exit 1 ;;
+esac
+
+#! Work directory
+workdir="$SLURM_SUBMIT_DIR"
+cd $workdir
+echo -e "Changed directory to `pwd`.\n"
+
+JOBID=$SLURM_JOB_ID
+echo -e "JobID: $JOBID\n======"
+echo "Time: `date`"
+echo "Running on master node: `hostname`"
+echo "Current directory: `pwd`"
+echo ""
+echo "Arguments:"
+echo "  Checkpoint: $CHECKPOINT"
+echo "  Dataset:    $DATASET"
+echo "  Mode:       $MODE"
+echo "  Config:     $CONFIG"
+echo ""
+
+if [ "$SLURM_JOB_NODELIST" ]; then
+    export NODEFILE=`generate_pbs_nodefile`
+    cat $NODEFILE | uniq > machine.file.$JOBID
+    echo -e "Nodes allocated:\n================"
+    echo `cat machine.file.$JOBID | sed -e 's/\..*$//g'`
+fi
+
+echo -e "\nnumtasks=$numtasks, numnodes=$numnodes, mpi_tasks_per_node=$mpi_tasks_per_node (OMP_NUM_THREADS=$OMP_NUM_THREADS)\n"
+
+SCRIPTS_DIR="$(dirname "$0")"
+
+set -e  # Exit on first error
+
+#! Step 1: Prepare data
+echo "============================================"
+echo "Step 1: Preparing data"
+echo "============================================"
+uv run python "$SCRIPTS_DIR/prepare_data.py" --dataset "$DATASET"
+
+#! Step 2: Segmentation
+if [[ "$MODE" == "segment" || "$MODE" == "all" ]]; then
+    # Filter config for segment mode (only point/box valid)
+    SEG_CONFIG="$CONFIG"
+    if [[ "$CONFIG" == "prev_mask" ]]; then
+        echo "Skipping segment mode (config=prev_mask is tracking-only)"
+        SEG_CONFIG=""
+    fi
+
+    if [[ -n "$SEG_CONFIG" ]]; then
+        echo ""
+        echo "============================================"
+        echo "Step 2: Running segmentation (config=$SEG_CONFIG)"
+        echo "============================================"
+        uv run python "$SCRIPTS_DIR/run_segment.py" \
+            -m "$CHECKPOINT" \
+            --dataset "$DATASET" \
+            --config "$SEG_CONFIG"
+    fi
+fi
+
+#! Step 3: Tracking
+if [[ "$MODE" == "track" || "$MODE" == "all" ]]; then
+    # Filter config for track mode (point/box/prev_mask all valid)
+    TRK_CONFIG="$CONFIG"
+
+    echo ""
+    echo "============================================"
+    echo "Step 3: Running tracking (config=$TRK_CONFIG)"
+    echo "============================================"
+    uv run python "$SCRIPTS_DIR/run_track.py" \
+        -m "$CHECKPOINT" \
+        --dataset "$DATASET" \
+        --config "$TRK_CONFIG"
+fi
+
+#! Step 4: Compute metrics
+echo ""
+echo "============================================"
+echo "Step 4: Computing metrics"
+echo "============================================"
+uv run python "$SCRIPTS_DIR/compute_metrics.py"
+
+#! Step 5: Analyze metrics
+echo ""
+echo "============================================"
+echo "Step 5: Analyzing metrics"
+echo "============================================"
+uv run python "$SCRIPTS_DIR/analyze_metrics.py"
+
+echo ""
+echo "============================================"
+echo "Pipeline complete!"
+echo "Time: `date`"
+echo "============================================"
