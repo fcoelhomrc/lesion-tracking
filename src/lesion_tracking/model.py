@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import einops
 import lightning as L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from IPython.core.debugger import set_trace
 from torchmetrics.classification import BinaryAccuracy, BinaryAUROC
 from transformers import (
     AutoImageProcessor,
