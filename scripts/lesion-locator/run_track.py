@@ -27,6 +27,7 @@ def run_track_case(
     output_dir: Path,
     checkpoint: str,
     device: str,
+    force: bool = False,
 ) -> bool:
     case_id = case_dir.name
 
@@ -42,6 +43,11 @@ def run_track_case(
         return False
 
     case_out = output_dir / case_id
+
+    if not force and case_out.exists() and any(case_out.glob("*.nii.gz")):
+        logger.info(f"Skipping {case_id} (outputs exist, use --force to re-run)")
+        return True
+
     case_out.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -111,6 +117,11 @@ def main():
         default=DEFAULT_OUTPUT,
         help=f"Output directory (default: {DEFAULT_OUTPUT})",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run cases even if outputs already exist",
+    )
     args = parser.parse_args()
 
     datasets = ["neov", "barts"] if args.dataset == "all" else [args.dataset]
@@ -131,7 +142,7 @@ def main():
             success = 0
             for case_dir in cases:
                 if run_track_case(
-                    case_dir, config, out_dir, args.checkpoint, args.device
+                    case_dir, config, out_dir, args.checkpoint, args.device, args.force
                 ):
                     success += 1
 
