@@ -182,9 +182,39 @@ class PoolingConfig:
     rope_theta: float = 10000.0
 
 
+@dataclass
+class MLPStackConfig:
+    num_hidden_layers: int = 1
+    hidden_dim: int = 256
+    dropout_rate: float = 0.1
+    activation: str = "gelu"
+
+
+@dataclass
+class SchedulerConfig:
+    name: str = "cosine"
+    warmup_steps: int = 0
+
+
+@dataclass
+class ClassificationModuleConfig:
+    backbone: str = "dinov2-small"
+    freeze_backbone: bool = True
+    num_classes: int = 1
+    lr: float = 1e-4
+    weight_decay: float = 1e-5
+    pooling: PoolingConfig = field(default_factory=PoolingConfig)
+    classifier: MLPStackConfig = field(default_factory=MLPStackConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+
 # =============================================================================
 # Factories
 # =============================================================================
+
+
+def make_encoder(backbone: str, freeze: bool = True) -> SliceBasedVolumeEncoder:
+    return SliceBasedVolumeEncoder(backbone=backbone, freeze=freeze)
 
 
 def make_mlp_stack(input_dim: int, output_dim: int, cfg: MLPStackConfig) -> MLPStack:
@@ -224,6 +254,62 @@ def make_metrics(num_classes: int, prefix: str = "") -> MetricCollection:
             }
         )
     return metrics.clone(prefix=prefix)
+
+
+SCHEDULERS = {
+    "cosine": torch.optim.lr_scheduler.CosineAnnealingLR,
+    "step": torch.optim.lr_scheduler.StepLR,
+    "plateau": torch.optim.lr_scheduler.ReduceLROnPlateau,
+}
+
+
+def make_scheduler(
+    optimizer: torch.optim.Optimizer, cfg: SchedulerConfig, max_epochs: int
+) -> torch.optim.lr_scheduler.LRScheduler:
+    scheduler_cls = SCHEDULERS.get(cfg.name)
+    assert scheduler_cls is not None, (
+        f"Invalid scheduler {cfg.name}, available: {list(SCHEDULERS)}"
+    )
+
+    if cfg.name == "cosine":
+        scheduler = scheduler_cls(optimizer, T_max=max_epochs)
+    elif cfg.name == "step":
+        scheduler = scheduler_cls(optimizer, step_size=max_epochs // 3)
+    elif cfg.name == "plateau":
+        scheduler = scheduler_cls(optimizer, mode="min", patience=5)
+    else:
+        raise NotImplementedError(
+            f"{cfg.name} is listed as an available scheduler, but was not implemented yet!"
+        )
+
+    if cfg.warmup_steps > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, total_iters=cfg.warmup_steps
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, scheduler], milestones=[cfg.warmup_steps]
+        )
+
+    return scheduler
+
+
+def make_callbacks() -> list[L.Callback]:
+    from lightning.pytorch.callbacks import (
+        EarlyStopping,
+        LearningRateMonitor,
+        ModelCheckpoint,
+        RichProgressBar,
+    )
+
+    # TODO: make this more flexible e.g. do not hardcode checkpoint condition
+    return [
+        EarlyStopping(monitor="val/loss", patience=10, mode="min"),
+        ModelCheckpoint(monitor="val/auroc", mode="max", save_top_k=1),
+        LearningRateMonitor(logging_interval="epoch"),
+        RichProgressBar(),
+    ]
+
+
 def make_pooling(hidden_size: int, cfg: PoolingConfig) -> AttentionBasedPooling:
     return AttentionBasedPooling(
         hidden_size=hidden_size,
@@ -249,12 +335,17 @@ class SliceBasedVolumeEncoder(nn.Module):
     def __init__(
         self,
         backbone: str,
+        freeze: bool = True,
     ):
         super().__init__()
         self.backbone = backbone
-        self._prepare_module()
+        self._build_module()
 
-    def _prepare_module(self):
+        if freeze:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+    def _build_module(self):
         model_path = VIT_ENCODERS.get(self.backbone)
         if not model_path:
             raise ValueError(f"Invalid feature extractor: {self.backbone}")
@@ -410,11 +501,11 @@ class AttentionBasedPooling(nn.Module):
         """
         if mask is not None:
             x = x * einops.rearrange(mask, "b z -> b z 1")
-            return x.sum(dim=1) / einops.rearrange(mask.sum(dim=1), "b -> b 1")
+            counts = mask.sum(dim=1).clamp(min=1)
+            return x.sum(dim=1) / einops.rearrange(counts, "b -> b 1")
         return x.mean(dim=1)
 
 
-class ClassificationModule(L.LightningModule):
 class MLPStack(nn.Sequential):
     def __init__(
         self,
@@ -456,20 +547,22 @@ class BaselineScanClassifier(L.LightningModule):
     def __init__(
         self,
         backbone: str,
+        freeze_backbone: bool,
+        num_classes: int,
         pooling: PoolingConfig,
-        lr: float = 1e-4,
-        weight_decay: float = 1e-5,
+        classifier: MLPStackConfig,
+        scheduler: SchedulerConfig,
+        lr: float,
+        weight_decay: float,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.backbone = backbone
         self.lr = lr
         self.weight_decay = weight_decay
+        self.scheduler_cfg = scheduler
+        self.num_classes = num_classes
 
-        encoder = SliceBasedVolumeEncoder(backbone=backbone)
-        self.encoder = encoder
-        self.pooling = make_pooling(encoder.hidden_size, pooling)
         self.loss_fn: Callable[..., torch.Tensor] = (
             nn.BCEWithLogitsLoss() if num_classes <= 2 else nn.CrossEntropyLoss()
         )
@@ -485,11 +578,8 @@ class BaselineScanClassifier(L.LightningModule):
 
     def forward(
         self,
-        images,
+        inputs: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
-        clinical_features: bool | None = None,
-    ):
-        cls_token, _ = self.encoder(images)
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         cls_token, _ = self.encoder(inputs)
 
@@ -808,7 +898,6 @@ def test_model_encoder_forward():
 
         logger.info(f"inputs: {inputs.shape, inputs.dtype}")
         volume_features, attn_weights = encoder.forward(inputs)
-        set_trace()
         return
 
 
