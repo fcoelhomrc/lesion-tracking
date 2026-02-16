@@ -48,6 +48,9 @@ VIT_ENCODERS = {
     "dinov2-base": "facebook/dinov2-base",
 }
 
+ACTIVATION_FUNC = {"gelu": nn.GELU, "relu": nn.ReLU, "leaky-relu": nn.LeakyReLU}
+
+
 # NOTE: Components should define their forward() methods with respect to single (case, timepoint) inputs
 # Iteration logic is a repsonsability of the caller
 
@@ -182,6 +185,32 @@ class PoolingConfig:
 # =============================================================================
 # Factories
 # =============================================================================
+
+
+def make_mlp_stack(input_dim: int, output_dim: int, cfg: MLPStackConfig) -> MLPStack:
+    return MLPStack(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        num_hidden_layers=cfg.num_hidden_layers,
+        hidden_dim=cfg.hidden_dim,
+        dropout_rate=cfg.dropout_rate,
+        activation=cfg.activation,
+    )
+
+
+def make_classification_module(
+    cfg: ClassificationModuleConfig,
+) -> BaselineScanClassifier:
+    return BaselineScanClassifier(
+        backbone=cfg.backbone,
+        freeze_backbone=cfg.freeze_backbone,
+        num_classes=cfg.num_classes,
+        pooling=cfg.pooling,
+        classifier=cfg.classifier,
+        scheduler=cfg.scheduler,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
 
 
 def make_metrics(num_classes: int, prefix: str = "") -> MetricCollection:
@@ -386,6 +415,44 @@ class AttentionBasedPooling(nn.Module):
 
 
 class ClassificationModule(L.LightningModule):
+class MLPStack(nn.Sequential):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_hidden_layers: int,
+        hidden_dim: int,
+        dropout_rate: float,
+        activation: str,
+    ):
+
+        stack = [
+            MLPBlock(input_dim, hidden_dim, dropout_rate, activation),
+            *[
+                MLPBlock(hidden_dim, hidden_dim, dropout_rate, activation)
+                for n in range(num_hidden_layers)
+            ],
+            nn.Linear(hidden_dim, output_dim),
+        ]
+        super().__init__(*stack)
+
+
+class MLPBlock(nn.Sequential):
+    def __init__(
+        self, input_dim: int, output_dim: int, dropout_rate: float, activation: str
+    ):
+        act_fn = ACTIVATION_FUNC.get(activation)
+        assert act_fn is not None, (
+            f"Invalid activation function {activation}, available: {list(ACTIVATION_FUNC)}"
+        )
+        super().__init__(
+            nn.Linear(input_dim, output_dim),
+            act_fn(),
+            nn.Dropout(dropout_rate),
+        )
+
+
+class BaselineScanClassifier(L.LightningModule):
     def __init__(
         self,
         backbone: str,
@@ -403,6 +470,15 @@ class ClassificationModule(L.LightningModule):
         encoder = SliceBasedVolumeEncoder(backbone=backbone)
         self.encoder = encoder
         self.pooling = make_pooling(encoder.hidden_size, pooling)
+        self.loss_fn: Callable[..., torch.Tensor] = (
+            nn.BCEWithLogitsLoss() if num_classes <= 2 else nn.CrossEntropyLoss()
+        )
+
+        self.encoder = make_encoder(backbone, freeze=freeze_backbone)
+        self.pooling = make_pooling(self.encoder.hidden_size, pooling)
+        self.classifier = make_mlp_stack(
+            self.encoder.hidden_size, num_classes, classifier
+        )
 
         self.train_metrics = make_metrics(num_classes, prefix="train/")
         self.val_metrics = make_metrics(num_classes, prefix="val/")
@@ -414,57 +490,95 @@ class ClassificationModule(L.LightningModule):
         clinical_features: bool | None = None,
     ):
         cls_token, _ = self.encoder(images)
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        cls_token, _ = self.encoder(inputs)
 
         if self.pooling.return_attention:
             volume_features, attn_scores = self.pooling(cls_token, attn_mask=attn_mask)
-            return volume_features, attn_scores
+            logits = self.classifier(volume_features)
+            return logits, attn_scores
         else:
             volume_features = self.pooling(cls_token, attn_mask=attn_mask)
-            return volume_features
+            logits = self.classifier(volume_features)
+            return logits
 
-    def _shared_step(self, batch):
-        images = batch["scan"]
-        clinical_features = batch["features"]
-        targets = batch["target"].float()
+    def _shared_step(
+        self, batch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # scans/masks: (B, L, N, C, X, Y, Z)
+        scans = batch["imaging"].get("scans")
+        assert scans is not None, (
+            f"Received batch without valid input data: 'scans' -> {scans}"
+        )
+        assert scans.shape[2] == 1  # Single patch (N = 1)
 
-        logits, attention_weights, pooled_features = self(images, clinical_features)
-        logits = logits.squeeze(-1)
-        loss = F.binary_cross_entropy_with_logits(logits, targets)
-        probs = torch.sigmoid(logits)
-        return loss, probs, targets
+        masks = batch["imaging"].get("masks")
+        assert isinstance(masks, torch.Tensor) or masks is None
+        if masks is not None:
+            assert masks.shape[2] == 1  # Single patch (N = 1)
 
-    def training_step(self, batch, batch_idx):
-        loss, probs, targets = self._shared_step(batch)
-        self.train_auroc.update(probs, targets.int())
-        self.train_acc.update(probs, targets.int())
+        targets = batch.get("targets").float()
+        assert targets is not None, (
+            f"Received batch without valid targets: 'targets' -> {targets}"
+        )
+        assert isinstance(targets, torch.Tensor)
+
+        # Select the baseline scan
+        inputs = einops.rearrange(scans[:, 0], "b 1 c x y z -> b c x y z")
+
+        # TODO: use segmentation masks as attention mask
+        # i.e. attn_mask[z] = any(mask[:, :, z] == 1))
+        if masks is not None:
+            # Select baseline mask
+            attn_mask = einops.rearrange(masks[:, 0], "b 1 1 x y z -> b x y z")
+            # Do not attend to z-slices that don't have lesion
+            attn_mask = einops.reduce(attn_mask > 0, "b x y z -> b z", "any")
+        else:
+            attn_mask = None
+
+        if self.pooling.return_attention:
+            logits, attn_weights = self.forward(inputs, attn_mask)
+        else:
+            logits = self(inputs, attn_mask)
+            attn_weights = None
+
+        if self.num_classes <= 2:
+            probs = torch.sigmoid(logits)
+            loss = self.loss_fn(logits, targets)
+        else:
+            probs = torch.softmax(logits, dim=-1)
+            loss = self.loss_fn(logits, targets.long())
+
+        return loss, probs, targets, attn_weights
+
+    def training_step(self, batch, batch_idx) -> torch.Tensor:
+        loss, probs, targets, attn_weights = self._shared_step(batch)
+        self.train_metrics.update(probs, targets.int())
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
     def on_train_epoch_end(self):
-        self.log("train/auroc", self.train_auroc.compute(), prog_bar=True)
-        self.log("train/acc", self.train_acc.compute())
-        self.train_auroc.reset()
-        self.train_acc.reset()
+        self.log_dict(self.train_metrics.compute(), prog_bar=True)
+        self.train_metrics.reset()
 
     def validation_step(self, batch, batch_idx):
-        loss, probs, targets = self._shared_step(batch)
-        self.val_auroc.update(probs, targets.int())
-        self.val_acc.update(probs, targets.int())
+        loss, probs, targets, attn_weights = self._shared_step(batch)
+        self.val_metrics.update(probs, targets.int())
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def on_validation_epoch_end(self):
-        self.log("val/auroc", self.val_auroc.compute(), prog_bar=True)
-        self.log("val/acc", self.val_acc.compute())
-        self.val_auroc.reset()
-        self.val_acc.reset()
+        self.log_dict(self.val_metrics.compute(), prog_bar=True)
+        self.val_metrics.reset()
 
-    def configure_optimizers(self):
+    def configure_optimizers(self):  # type: ignore
         optimizer = torch.optim.AdamW(
             self.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.trainer.max_epochs
+        scheduler = make_scheduler(
+            optimizer,
+            self.scheduler_cfg,
+            self.trainer.max_epochs,  # type: ignore
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
@@ -669,13 +783,15 @@ def test_model_encoder_forward():
             target_size=(38, 38, 24),
             spacing=(5.0, 5.0, 20.0),
         ),
-        loader=LoaderConfig(cases_per_batch=1, num_workers=0),
+        loader=LoaderConfig(cases_per_batch=4, num_workers=0),
     )
 
     loader = make_loader(cfg)
-    encoder = ClassificationModule(
-        backbone="dinov2-small",
-        pooling=PoolingConfig(return_attention=True),
+    encoder = make_classification_module(
+        ClassificationModuleConfig(
+            num_classes=3,
+            pooling=PoolingConfig(return_attention=True, use_rope=True),
+        )
     )
 
     for batch in loader:
