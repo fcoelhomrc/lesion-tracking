@@ -14,6 +14,8 @@ Controls:
     - Left-click on a lesion to fill the whole connected component with the selected label
     - Right-click on a lesion to pick its label (sets selected_label)
     - Hover over a lesion to see cc_id, seg label, and tracking label in the status bar
+    - s: soft tissue contrast window
+    - b: bone contrast window
     - Shift+N: new label mode (one-shot) — next left-click creates a new label
     - Shift+A: auto-initialize tracking labels from connected components (all timepoints)
     - Shift+P: propagate labels from t0 to later timepoints by disease site matching
@@ -26,16 +28,43 @@ import re
 from pathlib import Path
 
 import cc3d
+import matplotlib.colors as mcolors
 import napari
 import nibabel as nib
 import numpy as np
 import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
+from napari.utils.colormaps import DirectLabelColormap
 
 DEFAULT_DATASET = Path(__file__).parent.parent / "inputs" / "neov"
 TRACKING_DIR = "tracking"
-TARGET_SPACING = (1.0, 1.0, 5.0)
+TARGET_SPACING = (1.0, 1.0, 1.0)
+SOFT_TISSUE_CLIM = (-150, 250)
+BONE_CLIM = (-200, 1500)
+
+SEG_COLORMAP = DirectLabelColormap(
+    color_dict={
+        None: [0, 0, 0, 0],
+        0: [0, 0, 0, 0],
+        1: mcolors.to_rgba("moccasin"),
+        2: mcolors.to_rgba("mediumseagreen"),
+        3: mcolors.to_rgba("mediumaquamarine"),
+        4: mcolors.to_rgba("darkcyan"),
+        5: mcolors.to_rgba("cadetblue"),
+        6: mcolors.to_rgba("cornflowerblue"),
+        7: mcolors.to_rgba("royalblue"),
+        9: mcolors.to_rgba("mediumpurple"),
+        11: mcolors.to_rgba("plum"),
+        12: mcolors.to_rgba("violet"),
+        13: mcolors.to_rgba("orchid"),
+        14: mcolors.to_rgba("purple"),
+        15: mcolors.to_rgba("palevioletred"),
+        16: mcolors.to_rgba("navy"),
+        17: mcolors.to_rgba("teal"),
+        18: mcolors.to_rgba("gold"),
+    }
+)
 
 
 def resample_volume(
@@ -270,12 +299,21 @@ def load_case(dataset_path: Path, case_id: str):
     return timepoints, scans, masks, original_spacings, original_shapes
 
 
-def soft_tissue_window(scan: np.ndarray) -> np.ndarray:
+def _soft_tissue_window(scan: np.ndarray) -> np.ndarray:
     """Apply soft tissue HU window [-150, 250] -> [0, 1]."""
     out = scan.copy()
     np.clip(out, -150.0, 250.0, out=out)
     out -= -150.0
     out /= 400.0
+    return out
+
+
+def soft_tissue_window(scan: np.ndarray) -> np.ndarray:
+    out = scan.copy()
+    p1, p99 = np.percentile(scan, 1), np.percentile(scan, 99)
+    np.clip(out, p1, p99, out=out)
+    out -= p1
+    out /= p99
     return out
 
 
@@ -512,7 +550,7 @@ def main():
     tracking_data = {}
 
     for tp in timepoints:
-        displays[tp] = to_axial(soft_tissue_window(scans[tp]))
+        displays[tp] = to_axial(scans[tp].astype(np.float32))
         if masks[tp] is not None:
             lesions[tp] = to_axial(lesion_labels_from_mask(masks[tp]))
             masks[tp] = to_axial(masks[tp])
@@ -556,6 +594,7 @@ def main():
             name=f"scan{suffix}",
             translate=translate,
             colormap="gray",
+            contrast_limits=SOFT_TISSUE_CLIM,
         )
         if masks[tp] is not None:
             seg_layer = viewer.add_labels(
@@ -563,6 +602,7 @@ def main():
                 name=f"seg{suffix}",
                 translate=translate,
                 opacity=0.5,
+                colormap=SEG_COLORMAP,
             )
             seg_layer.contour = 2
         if lesions[tp] is not None:
@@ -752,6 +792,20 @@ def main():
                 n = lesions[tp].max()
                 print(f"Auto-initialized t{tp} with {n} lesion labels")
 
+    @viewer.bind_key("s")
+    def _soft_tissue_view(viewer):
+        for layer in viewer.layers:
+            if isinstance(layer, napari.layers.Image):
+                layer.contrast_limits = SOFT_TISSUE_CLIM
+        viewer.status = "Soft tissue window"
+
+    @viewer.bind_key("b")
+    def _bone_view(viewer):
+        for layer in viewer.layers:
+            if isinstance(layer, napari.layers.Image):
+                layer.contrast_limits = BONE_CLIM
+        viewer.status = "Bone window"
+
     @viewer.bind_key("Shift-P")
     def _propagate(viewer):
         """Propagate: for each tracking label in t0, find the corresponding
@@ -795,6 +849,8 @@ def main():
     print("  Hover        - Status bar shows cc_id, seg label, tracking label")
     print()
     print("Keybindings:")
+    print("  s       - Soft tissue contrast window")
+    print("  b       - Bone contrast window")
     print("  Shift+N - New label mode (one-shot): next left-click creates a new label")
     print("  Shift+A - Auto-initialize tracking labels from connected components")
     print("  Shift+P - Propagate t0 labels to all later timepoints (by disease site)")
