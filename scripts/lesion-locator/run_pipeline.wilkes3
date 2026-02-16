@@ -3,7 +3,7 @@
 #! LesionLocator evaluation pipeline on Wilkes3 (A100)
 #! Runs: prepare_data -> segment -> track -> compute_metrics -> analyze_metrics
 #!
-#! Usage: sbatch run_pipeline.wilkes3 /path/to/LesionLocatorCheckpoint [neov|barts|all] [segment|track|all] [point|box|prev_mask|all]
+#! Usage: sbatch run_pipeline.wilkes3 /path/to/LesionLocatorCheckpoint [output_dir] [neov|barts|all] [segment|track|all] [point|box|prev_mask|all]
 #!
 
 #!#############################################################
@@ -33,9 +33,10 @@ export OMP_NUM_THREADS=1
 
 #! Parse arguments
 CHECKPOINT="${1:?Error: checkpoint path required as first argument}"
-DATASET="${2:-neov}"
-MODE="${3:-all}"
-CONFIG="${4:-all}"
+OUTPUT_DIR="${2:-outputs/lesion-locator}"
+DATASET="${3:-neov}"
+MODE="${4:-all}"
+CONFIG="${5:-all}"
 
 #! Validate arguments
 if [[ ! -d "$CHECKPOINT" ]]; then
@@ -71,6 +72,7 @@ echo "Current directory: `pwd`"
 echo ""
 echo "Arguments:"
 echo "  Checkpoint: $CHECKPOINT"
+echo "  Output dir: $OUTPUT_DIR"
 echo "  Dataset:    $DATASET"
 echo "  Mode:       $MODE"
 echo "  Config:     $CONFIG"
@@ -93,7 +95,7 @@ set -e  # Exit on first error
 echo "============================================"
 echo "Step 1: Preparing data"
 echo "============================================"
-uv run python "$SCRIPTS_DIR/prepare_data.py" --dataset "$DATASET"
+uv run python "$SCRIPTS_DIR/prepare_data.py" --dataset "$DATASET" --output-dir "$OUTPUT_DIR/data"
 
 #! Step 2: Segmentation
 if [[ "$MODE" == "segment" || "$MODE" == "all" ]]; then
@@ -112,7 +114,9 @@ if [[ "$MODE" == "segment" || "$MODE" == "all" ]]; then
         uv run python "$SCRIPTS_DIR/run_segment.py" \
             -m "$CHECKPOINT" \
             --dataset "$DATASET" \
-            --config "$SEG_CONFIG"
+            --config "$SEG_CONFIG" \
+            --data-dir "$OUTPUT_DIR/data" \
+            --output-dir "$OUTPUT_DIR/segment"
     fi
 fi
 
@@ -128,7 +132,9 @@ if [[ "$MODE" == "track" || "$MODE" == "all" ]]; then
     uv run python "$SCRIPTS_DIR/run_track.py" \
         -m "$CHECKPOINT" \
         --dataset "$DATASET" \
-        --config "$TRK_CONFIG"
+        --config "$TRK_CONFIG" \
+        --data-dir "$OUTPUT_DIR/data" \
+        --output-dir "$OUTPUT_DIR/track"
 fi
 
 #! Step 4: Compute metrics
@@ -136,14 +142,14 @@ echo ""
 echo "============================================"
 echo "Step 4: Computing metrics"
 echo "============================================"
-uv run python "$SCRIPTS_DIR/compute_metrics.py"
+uv run python "$SCRIPTS_DIR/compute_metrics.py" --base-dir "$OUTPUT_DIR"
 
 #! Step 5: Analyze metrics
 echo ""
 echo "============================================"
 echo "Step 5: Analyzing metrics"
 echo "============================================"
-uv run python "$SCRIPTS_DIR/analyze_metrics.py"
+uv run python "$SCRIPTS_DIR/analyze_metrics.py" --metrics-file "$OUTPUT_DIR/metrics.json"
 
 echo ""
 echo "============================================"
