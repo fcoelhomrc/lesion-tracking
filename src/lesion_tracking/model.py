@@ -9,7 +9,14 @@ import lightning as L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchmetrics.classification import BinaryAccuracy, BinaryAUROC
+import wandb
+from torchmetrics import MetricCollection
+from torchmetrics.classification import (
+    BinaryAccuracy,
+    BinaryAUROC,
+    MulticlassAccuracy,
+    MulticlassAUROC,
+)
 from transformers import (
     AutoImageProcessor,
     AutoModel,
@@ -177,6 +184,17 @@ class PoolingConfig:
 # =============================================================================
 
 
+def make_metrics(num_classes: int, prefix: str = "") -> MetricCollection:
+    if num_classes <= 2:
+        metrics = MetricCollection({"auroc": BinaryAUROC(), "acc": BinaryAccuracy()})
+    else:
+        metrics = MetricCollection(
+            {
+                "auroc": MulticlassAUROC(num_classes=num_classes),
+                "acc": MulticlassAccuracy(num_classes=num_classes),
+            }
+        )
+    return metrics.clone(prefix=prefix)
 def make_pooling(hidden_size: int, cfg: PoolingConfig) -> AttentionBasedPooling:
     return AttentionBasedPooling(
         hidden_size=hidden_size,
@@ -386,10 +404,8 @@ class ClassificationModule(L.LightningModule):
         self.encoder = encoder
         self.pooling = make_pooling(encoder.hidden_size, pooling)
 
-        self.train_auroc = BinaryAUROC()
-        self.train_acc = BinaryAccuracy()
-        self.val_auroc = BinaryAUROC()
-        self.val_acc = BinaryAccuracy()
+        self.train_metrics = make_metrics(num_classes, prefix="train/")
+        self.val_metrics = make_metrics(num_classes, prefix="val/")
 
     def forward(
         self,
