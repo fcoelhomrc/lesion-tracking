@@ -198,9 +198,10 @@ class SchedulerConfig:
 
 @dataclass
 class ClassificationModuleConfig:
+    task: str
+    num_classes: int
     backbone: str = "dinov2-small"
     freeze_backbone: bool = True
-    num_classes: int = 1
     lr: float = 1e-4
     weight_decay: float = 1e-5
     pooling: PoolingConfig = field(default_factory=PoolingConfig)
@@ -231,7 +232,17 @@ def make_mlp_stack(input_dim: int, output_dim: int, cfg: MLPStackConfig) -> MLPS
 def make_classification_module(
     cfg: ClassificationModuleConfig,
 ) -> BaselineScanClassifier:
+    from lesion_tracking.dataset import TASKS
+
+    task_def = TASKS.get(cfg.task)
+    assert task_def is not None, f"Invalid task {cfg.task}, available: {list(TASKS)}"
+    assert task_def.task_type == "classification", (
+        f"Expected a classification task, got '{cfg.task}' ({task_def.task_type})"
+    )
+    assert len(task_def.keys) == 1, f"Expected a single target key, got {task_def.keys}"
+
     return BaselineScanClassifier(
+        target_key=task_def.keys[0],
         backbone=cfg.backbone,
         freeze_backbone=cfg.freeze_backbone,
         num_classes=cfg.num_classes,
@@ -293,7 +304,10 @@ def make_scheduler(
     return scheduler
 
 
-def make_callbacks() -> list[L.Callback]:
+def make_callbacks(
+    enable_checkpointing: bool = True,
+    enable_lr_monitor: bool = True,
+) -> list[L.Callback]:
     from lightning.pytorch.callbacks import (
         EarlyStopping,
         LearningRateMonitor,
@@ -302,12 +316,15 @@ def make_callbacks() -> list[L.Callback]:
     )
 
     # TODO: make this more flexible e.g. do not hardcode checkpoint condition
-    return [
+    callbacks: list[L.Callback] = [
         EarlyStopping(monitor="val/loss", patience=10, mode="min"),
-        ModelCheckpoint(monitor="val/auroc", mode="max", save_top_k=1),
-        LearningRateMonitor(logging_interval="epoch"),
         RichProgressBar(),
     ]
+    if enable_checkpointing:
+        callbacks.append(ModelCheckpoint(monitor="val/auroc", mode="max", save_top_k=1))
+    if enable_lr_monitor:
+        callbacks.append(LearningRateMonitor(logging_interval="epoch"))
+    return callbacks
 
 
 def make_pooling(hidden_size: int, cfg: PoolingConfig) -> AttentionBasedPooling:
@@ -462,11 +479,12 @@ class AttentionBasedPooling(nn.Module):
             Q = apply_rope(Q, self.rope_freqs)
             K = apply_rope(K, self.rope_freqs)
 
-        # (B, Z) -> (B, 1, 1, Z) additive mask for attention logits
+        # (B, Z) -> (B, 1, Z) additive mask for attention logits
+        # Broadcast along query dimension (the same keys are masked for every query)
         if attn_mask is not None:
             additive_mask = einops.rearrange(
                 torch.where(attn_mask, 0.0, float("-inf")),
-                "b z -> b 1 1 z",
+                "b z -> b 1 z",
             )
         else:
             additive_mask = None
@@ -481,12 +499,13 @@ class AttentionBasedPooling(nn.Module):
             )
             return self._masked_mean_pool(pooled, attn_mask)
 
-        # Batched matmul - Q @ K^T
+        # Batched matmul - Q @ K^T -> shape: (B, Z, Z)
         scores = einops.einsum(Q, K, "b i k, b j k -> b i j") / self.scale
         if additive_mask is not None:
             scores = scores + additive_mask
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
+
         # Batched matmul - attn_weights @ V
         pooled = einops.einsum(attn_weights, V, "b i j, b j k -> b i k")
         return self._masked_mean_pool(pooled, attn_mask), attn_weights
@@ -546,6 +565,7 @@ class MLPBlock(nn.Sequential):
 class BaselineScanClassifier(L.LightningModule):
     def __init__(
         self,
+        target_key: str,
         backbone: str,
         freeze_backbone: bool,
         num_classes: int,
@@ -562,6 +582,7 @@ class BaselineScanClassifier(L.LightningModule):
         self.weight_decay = weight_decay
         self.scheduler_cfg = scheduler
         self.num_classes = num_classes
+        self.target_key = target_key
 
         self.loss_fn: Callable[..., torch.Tensor] = (
             nn.BCEWithLogitsLoss() if num_classes <= 2 else nn.CrossEntropyLoss()
@@ -592,26 +613,56 @@ class BaselineScanClassifier(L.LightningModule):
             logits = self.classifier(volume_features)
             return logits
 
+    def _ingest_batch(
+        self, batch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # scans/masks: (B, L, N, C, X, Y, Z)
+
+        imaging = batch.get("imaging")
+        assert imaging is not None, "Missing 'imaging' values from batch"
+        scans = imaging.get("scans")
+        masks = imaging.get("masks")
+        is_padded = imaging.get("is_padded")
+        assert scans is not None, "Missing 'scans' values from batch"
+        assert scans.shape[2] == 1, (
+            f"{self.__name__} does not support multiple patches. Found {scans.shape[2]}, expected 1"
+        )
+
+        assert isinstance(masks, torch.Tensor) or masks is None
+        if masks is not None:
+            assert masks.shape[2] == 1, (
+                f"{self.__name__} does not support multiple patches. Found {masks.shape[2]}, expected 1"
+            )
+        assert scans.shape == masks.shape, (
+            f"Found incompatible scans and masks tensor: {scans.shape}, {masks.shape}"
+        )
+
+        assert is_padded is not None, "Missing 'is_padded' values from batch"
+        assert not is_padded.any(), (
+            f"{self.__name__} does not support padded inputs, got {is_padded}"
+        )
+
+        targets = batch.get("targets")
+        assert targets is not None, "Missing 'targets' values from batch"
+        assert self.target_key in targets, (
+            f"Missing '{self.target_key}' in targets {list(targets.keys())}"
+        )
+        targets = targets[self.target_key]
+        assert isinstance(targets, torch.Tensor), (
+            f"Expected torch.Tensor, found {type(targets)}"
+        )
+
+        return (
+            scans,
+            targets.float(),
+            masks,
+        )
+
     def _shared_step(
         self, batch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        # scans/masks: (B, L, N, C, X, Y, Z)
-        scans = batch["imaging"].get("scans")
-        assert scans is not None, (
-            f"Received batch without valid input data: 'scans' -> {scans}"
-        )
-        assert scans.shape[2] == 1  # Single patch (N = 1)
-
-        masks = batch["imaging"].get("masks")
-        assert isinstance(masks, torch.Tensor) or masks is None
-        if masks is not None:
-            assert masks.shape[2] == 1  # Single patch (N = 1)
-
-        targets = batch.get("targets").float()
-        assert targets is not None, (
-            f"Received batch without valid targets: 'targets' -> {targets}"
-        )
-        assert isinstance(targets, torch.Tensor)
+        # TODO: does not feel right to need all this validation here... what is the point of e.g. iterator helpers in dataset.py module?
+        scans, targets, masks = self._ingest_batch(batch)
 
         # Select the baseline scan
         inputs = einops.rearrange(scans[:, 0], "b 1 c x y z -> b c x y z")
@@ -627,12 +678,13 @@ class BaselineScanClassifier(L.LightningModule):
             attn_mask = None
 
         if self.pooling.return_attention:
-            logits, attn_weights = self.forward(inputs, attn_mask)
+            logits, attn_weights = self(inputs, attn_mask)
         else:
             logits = self(inputs, attn_mask)
             attn_weights = None
 
         if self.num_classes <= 2:
+            logits = einops.rearrange(logits, "b 1 -> b")
             probs = torch.sigmoid(logits)
             loss = self.loss_fn(logits, targets)
         else:
@@ -854,7 +906,8 @@ def test_split_global_and_local_features():
         return
 
 
-def test_model_encoder_forward():
+def test_lightning_module():
+    # FIXME: the ingest_batch must be wrong  (we validated the comps individually, but i am getting einops errors. must be a shape mismatch... i hate python)
     from lesion_tracking.config import (
         Config,
         DatasetConfig,
@@ -867,38 +920,35 @@ def test_model_encoder_forward():
         dataset=DatasetConfig(
             dataset_path="inputs/neov",
             enable_augmentations=False,
+            task="crs",
+            drop_missing_targets=True,
         ),
         preprocessing=PreprocessingConfig(
             normalization="soft_tissue",
             target_size=(38, 38, 24),
             spacing=(5.0, 5.0, 20.0),
         ),
-        loader=LoaderConfig(cases_per_batch=4, num_workers=0),
+        loader=LoaderConfig(cases_per_batch=4, num_workers=4),
     )
 
     loader = make_loader(cfg)
-    encoder = make_classification_module(
+    model = make_classification_module(
         ClassificationModuleConfig(
+            task="crs",
             num_classes=3,
             pooling=PoolingConfig(return_attention=True, use_rope=True),
         )
     )
 
-    for batch in loader:
-        logger.info("Loaded batch...")
-        inputs = batch.get("imaging")
-        if any(inputs.get("is_padded").flatten().tolist()):
-            logger.warning(
-                f"Skipping batch. Reason: has padded inputs {inputs.get('is_padded').flatten().tolist()}"
-            )
-            continue
-        inputs = inputs.get("scans")
-        # Take the first timepoint (assume N = 1)
-        inputs = inputs[:, 0, 0]  # (B, C, X, Y, Z) with C=1
-
-        logger.info(f"inputs: {inputs.shape, inputs.dtype}")
-        volume_features, attn_weights = encoder.forward(inputs)
-        return
+    trainer = L.Trainer(
+        max_epochs=2,
+        limit_train_batches=2,
+        limit_val_batches=1,
+        callbacks=make_callbacks(enable_checkpointing=False, enable_lr_monitor=False),
+        enable_checkpointing=False,
+        logger=False,
+    )
+    trainer.fit(model, train_dataloaders=loader, val_dataloaders=loader)
 
 
 # =============================================================================
@@ -909,7 +959,7 @@ def test_model_encoder_forward():
 def main():
     # test_volume_to_rgb_slices()
     # test_split_global_and_local_features()
-    test_model_encoder_forward()
+    test_lightning_module()
 
 
 if __name__ == "__main__":
