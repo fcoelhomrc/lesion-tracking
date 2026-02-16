@@ -23,6 +23,7 @@ class DatasetConfig:
     allow_missing_scans: bool = False
     allow_missing_masks: bool = False
     task: str | None = None
+    drop_missing_targets: bool = False
     feature_groups: list[str] | None = None
     caching_strategy: str | None = "disk"
     cache_dir: str | None = None
@@ -83,6 +84,7 @@ def make_loader(cfg: Config):
         normalization=cfg.preprocessing.normalization,
         enable_augmentations=cfg.dataset.enable_augmentations,
         task=cfg.dataset.task,
+        drop_missing_targets=cfg.dataset.drop_missing_targets,
         feature_groups=cfg.dataset.feature_groups,
         scans_dir=cfg.dataset.scans_dir,
         masks_dir=cfg.dataset.masks_dir,

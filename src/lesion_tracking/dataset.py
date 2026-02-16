@@ -403,6 +403,7 @@ class LongitudinalDataset(Dataset):
         normalization: str = "zscore",
         lazy_resampling: bool = True,
         task: str | None = None,
+        drop_missing_targets: bool = False,
         feature_groups: list[str] | None = None,
         caching_strategy: str | None = "disk",
         cache_dir: str | None = None,
@@ -424,6 +425,7 @@ class LongitudinalDataset(Dataset):
         self._lazy_resampling = lazy_resampling
 
         self._task = TASKS.get(task) if task is not None else None
+        self._drop_missing_targets = drop_missing_targets
         self._feature_groups = feature_groups
 
         self._caching_strategy = caching_strategy
@@ -484,6 +486,18 @@ class LongitudinalDataset(Dataset):
 
         self._metadata = metadata
         self._cases = cases
+
+        if self._drop_missing_targets and self._task:
+            before = len(flat_items)
+            flat_items = [
+                item for item in flat_items if self._has_target(item[0], metadata)
+            ]
+            dropped = before - len(flat_items)
+            if dropped > 0:
+                logger.info(
+                    f"Dropped {dropped} items with missing targets for task '{self._task.name}'"
+                )
+
         self._flat_items = [
             (case_id, tp, idx) for idx, (case_id, tp, _, _) in enumerate(flat_items)
         ]
@@ -491,6 +505,16 @@ class LongitudinalDataset(Dataset):
         self._case_to_flat_indices = defaultdict(list)
         for flat_idx, (case_id, _, _) in enumerate(self._flat_items):
             self._case_to_flat_indices[case_id].append(flat_idx)
+
+    def _has_target(self, case_id: str, metadata: dict) -> bool:
+        case_metadata = metadata.get(case_id)
+        if case_metadata is None:
+            return False
+        try:
+            parsed = parse_metadata(case_metadata, self._task.keys)
+            return all(v is not None for v in parsed.values())
+        except RuntimeError:
+            return False
 
     @property
     def num_scans(self) -> int:
@@ -948,9 +972,16 @@ def longitudinal_collate_fn(batch: list[dict]) -> dict:
         "is_padded": is_padded_out,  # (batch, tp)
     }
 
-    # Optionals - depend on Dataset configuration
-    output["targets"] = output.get("targets")
-    output["features"] = output.get("features")
+    output["targets"] = (
+        {k: torch.tensor(v) for k, v in output["targets"].items()}
+        if has_targets
+        else None
+    )
+    output["features"] = (
+        {k: torch.tensor(v) for k, v in output["features"].items()}
+        if has_features
+        else None
+    )
 
     return output
 
@@ -1169,6 +1200,7 @@ def get_loader(
     normalization: str = "zscore",
     enable_augmentations: bool = False,
     task: str | None = None,
+    drop_missing_targets: bool = False,
     feature_groups: list[str] | None = None,
     fold: int | None = None,
     split: str | None = None,
@@ -1191,6 +1223,7 @@ def get_loader(
         spacing=spacing,
         normalization=normalization,
         task=task,
+        drop_missing_targets=drop_missing_targets,
         feature_groups=feature_groups,
         caching_strategy="disk",
         enable_augmentations=enable_augmentations,
