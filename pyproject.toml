@@ -27,6 +27,9 @@ dependencies = [
   "openpyxl>=3.1.5",
 ]
 
+[dependency-groups]
+lesion-locator = ["lesionlocator @ git+https://github.com/MIC-DKFZ/LesionLocator"]
+
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
