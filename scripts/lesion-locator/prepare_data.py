@@ -61,14 +61,27 @@ def prepare_case(
     scans_dir = case_dir / "scans"
     masks_dir = case_dir / "masks"
 
-    for scan_path in sorted(scans_dir.glob(f"{case_id}_t*.nii.gz")):
+    scan_pattern = f"{case_id}_t*.nii.gz"
+    mask_pattern = f"{case_id}_t*.nii.gz"
+    scan_matches = sorted(scans_dir.glob(scan_pattern))
+    mask_matches = sorted(masks_dir.glob(mask_pattern))
+    logger.info(f"  scans_dir: {scans_dir} (exists={scans_dir.exists()})")
+    logger.info(f"  masks_dir: {masks_dir} (exists={masks_dir.exists()})")
+    logger.info(f"  scan glob '{scan_pattern}': {len(scan_matches)} matches")
+    logger.info(f"  mask glob '{mask_pattern}': {len(mask_matches)} matches")
+    if scan_matches:
+        logger.info(f"    first: {scan_matches[0]}")
+    if mask_matches:
+        logger.info(f"    first: {mask_matches[0]}")
+
+    for scan_path in scan_matches:
         tp = scan_path.stem.split("_")[-1].replace(".nii", "")  # e.g. "t0"
         link_path = out_case / f"scan_{tp}.nii.gz"
         if link_path.exists() or link_path.is_symlink():
             link_path.unlink()
         link_path.symlink_to(scan_path.resolve())
 
-    for mask_path in sorted(masks_dir.glob(f"{case_id}_t*.nii.gz")):
+    for mask_path in mask_matches:
         tp = mask_path.stem.split("_")[-1].replace(".nii", "")
         out_mask_path = out_case / f"mask_{tp}.nii.gz"
 
