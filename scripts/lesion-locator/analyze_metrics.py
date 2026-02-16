@@ -312,17 +312,36 @@ def main():
     )
     args = parser.parse_args()
 
+    if not args.metrics_file.exists():
+        logger.error(f"Metrics file not found: {args.metrics_file}")
+        return
+
     with open(args.metrics_file) as f:
         records = json.load(f)
 
     logger.info(f"Loaded {len(records)} records from {args.metrics_file}")
 
+    if not records:
+        logger.warning("No records to analyze!")
+        return
+
+    modes = set(r["mode"] for r in records)
+    configs = set(r["config"] for r in records)
+    datasets = set(r["dataset"] for r in records)
+    sites = set(r["site"] for r in records)
+    logger.info(f"Modes: {modes}, Configs: {configs}, Datasets: {datasets}")
+    logger.info(
+        f"Sites: {len(sites)} unique ({len([s for s in sites if s != 'all'])} disease sites + 'all')"
+    )
+    logger.info(f"Filters applied: mode={args.mode}, config={args.config}")
+
     console = Console()
     console.print()
 
-    overall_summary(
-        filter_records(records, mode=args.mode, config=args.config), console
-    )
+    filtered = filter_records(records, mode=args.mode, config=args.config)
+    logger.info(f"After filtering: {len(filtered)} records")
+
+    overall_summary(filtered, console)
     per_site_table(records, console, mode=args.mode, config=args.config)
     per_recist_table(records, console, mode=args.mode, config=args.config)
 

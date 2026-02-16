@@ -55,8 +55,6 @@ def prepare_case(
     min_size: int,
 ) -> None:
     case_id = case_dir.name
-    out_case = output_dir / case_id
-    out_case.mkdir(parents=True, exist_ok=True)
 
     scans_dir = case_dir / "scans"
     masks_dir = case_dir / "masks"
@@ -74,17 +72,42 @@ def prepare_case(
     if mask_matches:
         logger.info(f"    first: {mask_matches[0]}")
 
-    for scan_path in scan_matches:
-        tp = scan_path.stem.split("_")[-1].replace(".nii", "")  # e.g. "t0"
+    # Build {tp: scan_path} and {tp: mask_path} lookups
+    def _extract_tp(path: Path) -> str:
+        return path.stem.split("_")[-1].replace(".nii", "")
+
+    scans_by_tp = {_extract_tp(p): p for p in scan_matches}
+    masks_by_tp = {_extract_tp(p): p for p in mask_matches}
+    valid_tps = sorted(scans_by_tp.keys() & masks_by_tp.keys())
+
+    scan_only = sorted(scans_by_tp.keys() - masks_by_tp.keys())
+    mask_only = sorted(masks_by_tp.keys() - scans_by_tp.keys())
+    if scan_only:
+        logger.warning(f"  {case_id}: skipping timepoints with no mask: {scan_only}")
+    if mask_only:
+        logger.warning(f"  {case_id}: skipping timepoints with no scan: {mask_only}")
+
+    if not valid_tps:
+        logger.warning(f"  {case_id}: no valid scan+mask pairs, skipping case")
+        return
+
+    logger.info(f"  {case_id}: {len(valid_tps)} valid timepoints: {valid_tps}")
+
+    out_case = output_dir / case_id
+    out_case.mkdir(parents=True, exist_ok=True)
+
+    for tp in valid_tps:
+        scan_path = scans_by_tp[tp]
+        mask_path = masks_by_tp[tp]
+
+        # Symlink scan
         link_path = out_case / f"scan_{tp}.nii.gz"
         if link_path.exists() or link_path.is_symlink():
             link_path.unlink()
         link_path.symlink_to(scan_path.resolve())
 
-    for mask_path in mask_matches:
-        tp = mask_path.stem.split("_")[-1].replace(".nii", "")
+        # Process mask
         out_mask_path = out_case / f"mask_{tp}.nii.gz"
-
         if out_mask_path.exists():
             logger.info(f"  Skipping {out_mask_path.name} (already exists)")
             continue

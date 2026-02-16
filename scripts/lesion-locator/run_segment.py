@@ -40,15 +40,29 @@ def stage_flat_dir(
     masks_dir.mkdir(parents=True, exist_ok=True)
 
     count = 0
-    for case_dir in sorted(data_dir.iterdir()):
-        if not case_dir.is_dir():
-            continue
+    logger.info(f"  Staging from: {data_dir} (exists={data_dir.exists()})")
+
+    case_dirs = (
+        sorted(d for d in data_dir.iterdir() if d.is_dir()) if data_dir.exists() else []
+    )
+    logger.info(f"  Found {len(case_dirs)} case directories")
+
+    for case_dir in case_dirs:
         case_id = case_dir.name
-        for scan in sorted(case_dir.glob("scan_t*.nii.gz")):
+        scans = sorted(case_dir.glob("scan_t*.nii.gz"))
+        if not scans:
+            all_files = list(case_dir.iterdir())
+            logger.warning(
+                f"  {case_id}: no scan_t*.nii.gz files found "
+                f"({len(all_files)} items in dir: {[f.name for f in all_files[:5]]})"
+            )
+            continue
+
+        for scan in scans:
             tp = scan.name.replace("scan_", "").replace(".nii.gz", "")  # e.g. "t0"
             mask = case_dir / f"mask_{tp}.nii.gz"
             if not mask.exists():
-                logger.warning(f"No mask for {case_id} {tp}, skipping")
+                logger.warning(f"  {case_id}: no mask for {tp}, skipping")
                 continue
 
             flat_name = f"{case_id}_{tp}.nii.gz"
@@ -60,6 +74,7 @@ def stage_flat_dir(
             if not mask_link.exists():
                 mask_link.symlink_to(mask.resolve())
             count += 1
+            logger.debug(f"  {case_id}/{tp}: staged {flat_name}")
 
     return count
 
@@ -152,12 +167,19 @@ def main():
     datasets = ["neov", "barts"] if args.dataset == "all" else [args.dataset]
     configs = CONFIGS if args.config == "all" else [args.config]
 
+    logger.info(f"Data dir: {args.data_dir} (exists={args.data_dir.exists()})")
+    logger.info(f"Output dir: {args.output_dir}")
+    logger.info(f"Checkpoint: {args.checkpoint}")
+    logger.info(f"Device: {args.device}")
+    logger.info(f"Datasets: {datasets}, Configs: {configs}")
+
     for ds_name in datasets:
-        if not (args.data_dir / ds_name).exists():
-            logger.warning(
-                f"No prepared data for {ds_name} at {args.data_dir / ds_name}"
-            )
+        ds_path = args.data_dir / ds_name
+        if not ds_path.exists():
+            logger.warning(f"No prepared data for {ds_name} at {ds_path}")
             continue
+        n_cases = sum(1 for p in ds_path.iterdir() if p.is_dir())
+        logger.info(f"Dataset {ds_name}: {n_cases} case directories at {ds_path}")
         for config in configs:
             logger.info(f"=== {ds_name} / {config} ===")
             run_segment(

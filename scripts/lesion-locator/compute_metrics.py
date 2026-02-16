@@ -142,13 +142,25 @@ def process_segment_outputs(
             dataset = ds_dir.name  # neov or barts
 
             # Group prediction files by (case_id, tp)
+            all_niftis = sorted(ds_dir.glob("*.nii.gz"))
+            logger.info(f"  {config}/{dataset}: {len(all_niftis)} nifti files found")
+            if all_niftis and len(all_niftis) <= 5:
+                logger.info(f"    Files: {[f.name for f in all_niftis]}")
+
             pred_files: dict[tuple[str, str], list[Path]] = {}
-            for f in sorted(ds_dir.glob("*.nii.gz")):
+            unmatched = []
+            for f in all_niftis:
                 # Expected: case_XXXX_tN_lesion_M.nii.gz
                 match = re.match(r"(case_\d+)_(t\d+)_lesion_\d+\.nii\.gz", f.name)
                 if match:
                     key = (match.group(1), match.group(2))
                     pred_files.setdefault(key, []).append(f)
+                else:
+                    unmatched.append(f.name)
+
+            if unmatched:
+                logger.warning(f"    {len(unmatched)} unmatched files: {unmatched[:5]}")
+            logger.info(f"    {len(pred_files)} (case, tp) groups from predictions")
 
             for (case_id, tp), files in pred_files.items():
                 gt_path = get_gt_mask_path(inputs_dir, dataset, case_id, tp)
@@ -228,13 +240,19 @@ def process_track_outputs(
                 continue
             dataset = ds_dir.name
 
-            for case_dir in sorted(ds_dir.iterdir()):
-                if not case_dir.is_dir():
-                    continue
+            case_dirs = sorted(d for d in ds_dir.iterdir() if d.is_dir())
+            logger.info(f"  {config}/{dataset}: {len(case_dirs)} case directories")
+
+            for case_dir in case_dirs:
                 case_id = case_dir.name
+                all_niftis = sorted(case_dir.glob("*.nii.gz"))
+                if not all_niftis:
+                    logger.warning(f"    {case_id}: no nifti files in output dir")
+                    continue
 
                 pred_files: dict[str, list[Path]] = {}
-                for f in sorted(case_dir.glob("*.nii.gz")):
+                unmatched = []
+                for f in all_niftis:
                     # Expected: scan_tN_lesion_M.nii.gz or case_XXXX_tN_lesion_M.nii.gz
                     match = re.match(
                         r"(?:scan_|(?:case_\d+_))(t\d+)_lesion_\d+\.nii\.gz", f.name
@@ -242,6 +260,18 @@ def process_track_outputs(
                     if match:
                         tp = match.group(1)
                         pred_files.setdefault(tp, []).append(f)
+                    else:
+                        unmatched.append(f.name)
+
+                if unmatched:
+                    logger.warning(
+                        f"    {case_id}: {len(unmatched)} unmatched files: {unmatched[:3]}"
+                    )
+
+                logger.info(
+                    f"    {case_id}: {len(all_niftis)} niftis, "
+                    f"{len(pred_files)} timepoints: {list(pred_files.keys())}"
+                )
 
                 for tp, files in pred_files.items():
                     gt_path = get_gt_mask_path(inputs_dir, dataset, case_id, tp)
@@ -323,15 +353,31 @@ def main():
     output_path = args.output or (args.base_dir / "metrics.json")
     records: list[dict] = []
 
+    logger.info(f"Base dir: {args.base_dir} (exists={args.base_dir.exists()})")
+    logger.info(f"Inputs dir: {args.inputs_dir} (exists={args.inputs_dir.exists()})")
+    logger.info(f"Output path: {output_path}")
+
     segment_dir = args.base_dir / "segment"
     if segment_dir.exists():
-        logger.info("Processing segmentation outputs...")
+        configs = [d.name for d in sorted(segment_dir.iterdir()) if d.is_dir()]
+        logger.info(f"Processing segmentation outputs... (configs: {configs})")
         process_segment_outputs(segment_dir, args.inputs_dir, records)
+        logger.info(f"  -> {len(records)} records so far")
+    else:
+        logger.warning(f"No segment dir at {segment_dir}")
 
     track_dir = args.base_dir / "track"
+    n_before = len(records)
     if track_dir.exists():
-        logger.info("Processing tracking outputs...")
+        configs = [d.name for d in sorted(track_dir.iterdir()) if d.is_dir()]
+        logger.info(f"Processing tracking outputs... (configs: {configs})")
         process_track_outputs(track_dir, args.inputs_dir, records)
+        logger.info(f"  -> {len(records) - n_before} track records added")
+    else:
+        logger.warning(f"No track dir at {track_dir}")
+
+    if not records:
+        logger.warning("No metric records computed! Check that prediction files exist.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:

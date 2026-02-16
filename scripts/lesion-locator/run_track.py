@@ -30,22 +30,32 @@ def run_track_case(
     force: bool = False,
 ) -> bool:
     case_id = case_dir.name
+    logger.info(f"  Processing {case_id}")
 
     scan_t0 = case_dir / "scan_t0.nii.gz"
     scan_t1 = case_dir / "scan_t1.nii.gz"
     mask_t0 = case_dir / "mask_t0.nii.gz"
 
+    available = [f.name for f in case_dir.iterdir()]
+    logger.info(f"    Files in case dir: {available}")
+
     if not scan_t0.exists() or not scan_t1.exists():
-        logger.warning(f"Missing scans for {case_id}, skipping")
+        logger.warning(
+            f"    Missing scans for {case_id} "
+            f"(t0={scan_t0.exists()}, t1={scan_t1.exists()}), skipping"
+        )
         return False
     if not mask_t0.exists():
-        logger.warning(f"Missing mask_t0 for {case_id}, skipping")
+        logger.warning(f"    Missing mask_t0 for {case_id}, skipping")
         return False
 
     case_out = output_dir / case_id
 
     if not force and case_out.exists() and any(case_out.glob("*.nii.gz")):
-        logger.info(f"Skipping {case_id} (outputs exist, use --force to re-run)")
+        existing = list(case_out.glob("*.nii.gz"))
+        logger.info(
+            f"    Skipping {case_id} ({len(existing)} outputs exist, use --force to re-run)"
+        )
         return True
 
     case_out.mkdir(parents=True, exist_ok=True)
@@ -127,6 +137,13 @@ def main():
     datasets = ["neov", "barts"] if args.dataset == "all" else [args.dataset]
     configs = CONFIGS if args.config == "all" else [args.config]
 
+    logger.info(f"Data dir: {args.data_dir} (exists={args.data_dir.exists()})")
+    logger.info(f"Output dir: {args.output_dir}")
+    logger.info(f"Checkpoint: {args.checkpoint}")
+    logger.info(f"Device: {args.device}")
+    logger.info(f"Force: {args.force}")
+    logger.info(f"Datasets: {datasets}, Configs: {configs}")
+
     for ds_name in datasets:
         ds_dir = args.data_dir / ds_name
         if not ds_dir.exists():
@@ -134,21 +151,29 @@ def main():
             continue
 
         cases = sorted(p for p in ds_dir.iterdir() if p.is_dir())
+        logger.info(f"Dataset {ds_name}: {len(cases)} case directories at {ds_dir}")
 
         for config in configs:
             out_dir = args.output_dir / config / ds_name
-            logger.info(f"=== {ds_name} / {config}: {len(cases)} cases ===")
+            logger.info(
+                f"=== {ds_name} / {config}: {len(cases)} cases -> {out_dir} ==="
+            )
 
             success = 0
+            failed = []
             for case_dir in cases:
                 if run_track_case(
                     case_dir, config, out_dir, args.checkpoint, args.device, args.force
                 ):
                     success += 1
+                else:
+                    failed.append(case_dir.name)
 
             logger.info(
                 f"Completed {success}/{len(cases)} cases for {ds_name}/{config}"
             )
+            if failed:
+                logger.warning(f"Failed cases: {failed}")
 
     logger.info("All tracking runs complete.")
 
