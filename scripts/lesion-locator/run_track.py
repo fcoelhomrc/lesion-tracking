@@ -61,6 +61,8 @@ def run_track_case(
     case_out.mkdir(parents=True, exist_ok=True)
 
     cmd = [
+        "uv",
+        "run",
         "LesionLocator_track",
         "-bl",
         str(scan_t0.resolve()),

@@ -100,6 +100,8 @@ def run_segment(
             return
 
         cmd = [
+            "uv",
+            "run",
             "LesionLocator_segment",
             "-i",
             str(staging_path / "images"),
