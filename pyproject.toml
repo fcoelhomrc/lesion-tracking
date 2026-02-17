@@ -28,7 +28,7 @@ dependencies = [
   "wandb>=0.25.0",
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 lesion-locator = ["lesionlocator @ git+https://github.com/MIC-DKFZ/LesionLocator"]
 
 [[tool.uv.index]]
