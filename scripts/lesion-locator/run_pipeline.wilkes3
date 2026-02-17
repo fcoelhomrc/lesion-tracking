@@ -120,11 +120,15 @@ echo -e "\nnumtasks=$numtasks, numnodes=$numnodes, mpi_tasks_per_node=$mpi_tasks
 
 set -e
 
+#! Sync venv once (with lesion-locator extra)
+echo -e "\nSyncing venv..."
+uv sync --extra lesion-locator
+
 #! Step 1: Prepare data
 echo -e "\n============================================"
 echo "Step 1: Preparing data"
 echo "============================================"
-uv run python "$SCRIPTS_DIR/prepare_data.py" --dataset "$DATASET" --output-dir "$OUTPUT_DIR/data"
+uv run --no-sync python "$SCRIPTS_DIR/prepare_data.py" --dataset "$DATASET" --output-dir "$OUTPUT_DIR/data"
 
 #! Step 2: Segmentation
 if [[ "$MODE" == "segment" || "$MODE" == "all" ]]; then
@@ -138,7 +142,7 @@ if [[ "$MODE" == "segment" || "$MODE" == "all" ]]; then
         echo -e "\n============================================"
         echo "Step 2: Running segmentation (config=$SEG_CONFIG)"
         echo "============================================"
-        uv run python "$SCRIPTS_DIR/run_segment.py" \
+        uv run --no-sync python "$SCRIPTS_DIR/run_segment.py" \
             -m "$CHECKPOINT" \
             --dataset "$DATASET" \
             --config "$SEG_CONFIG" \
@@ -158,7 +162,7 @@ if [[ "$MODE" == "track" || "$MODE" == "all" ]]; then
     if [[ "$FORCE" == "--force" ]]; then
         FORCE_FLAG="--force"
     fi
-    uv run python "$SCRIPTS_DIR/run_track.py" \
+    uv run --no-sync python "$SCRIPTS_DIR/run_track.py" \
         -m "$CHECKPOINT" \
         --dataset "$DATASET" \
         --config "$TRK_CONFIG" \
@@ -171,13 +175,13 @@ fi
 echo -e "\n============================================"
 echo "Step 4: Computing metrics"
 echo "============================================"
-uv run python "$SCRIPTS_DIR/compute_metrics.py" --base-dir "$OUTPUT_DIR"
+uv run --no-sync python "$SCRIPTS_DIR/compute_metrics.py" --base-dir "$OUTPUT_DIR"
 
 #! Step 5: Analyze metrics
 echo -e "\n============================================"
 echo "Step 5: Analyzing metrics"
 echo "============================================"
-uv run python "$SCRIPTS_DIR/analyze_metrics.py" --metrics-file "$OUTPUT_DIR/metrics.json"
+uv run --no-sync python "$SCRIPTS_DIR/analyze_metrics.py" --metrics-file "$OUTPUT_DIR/metrics.json"
 
 echo -e "\n============================================"
 echo "Pipeline complete!"

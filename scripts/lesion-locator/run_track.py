@@ -63,6 +63,7 @@ def run_track_case(
     cmd = [
         "uv",
         "run",
+        "--no-sync",
         "LesionLocator_track",
         "-bl",
         str(scan_t0.resolve()),

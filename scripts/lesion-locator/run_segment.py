@@ -102,6 +102,7 @@ def run_segment(
         cmd = [
             "uv",
             "run",
+            "--no-sync",
             "LesionLocator_segment",
             "-i",
             str(staging_path / "images"),
