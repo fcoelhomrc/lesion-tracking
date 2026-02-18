@@ -3,9 +3,11 @@
 Creates a directory structure with:
 - Symlinked scans (unprocessed, LesionLocator handles preprocessing internally)
 - Instance-labeled masks (semantic -> connected components, small objects removed)
+- Site maps: JSON mapping instance IDs to original disease-site labels
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import cc3d
@@ -23,12 +25,16 @@ DEFAULT_OUTPUT = (
 )
 
 
-def semantic_to_instance(mask: np.ndarray, min_size: int = 10) -> np.ndarray:
+def semantic_to_instance(
+    mask: np.ndarray, min_size: int = 10
+) -> tuple[np.ndarray, dict[int, int]]:
     """Convert semantic segmentation mask to instance labels.
 
     1. Binarize (all disease sites merged)
     2. Connected component analysis
     3. Remove small objects below min_size voxels
+
+    Returns instance mask and site_map {instance_id: semantic_label}.
     """
     binary = (mask > 0).astype(np.uint16)
     instance = cc3d.connected_components(binary).astype(np.int32)
@@ -39,14 +45,32 @@ def semantic_to_instance(mask: np.ndarray, min_size: int = 10) -> np.ndarray:
         instance_t = remover(instance[np.newaxis])
         instance = instance_t[0]
 
-    # Re-label consecutively after removal
+    # Re-label consecutively after removal and build site map
     unique_labels = np.unique(instance)
     unique_labels = unique_labels[unique_labels > 0]
     relabeled = np.zeros_like(instance)
+    site_map: dict[int, int] = {}
     for new_id, old_id in enumerate(unique_labels, start=1):
-        relabeled[instance == old_id] = new_id
+        component_mask = instance == old_id
+        relabeled[component_mask] = new_id
+        # Majority semantic label for this component
+        semantic_vals = mask[component_mask]
+        site_map[new_id] = int(np.bincount(semantic_vals).argmax())
 
-    return relabeled
+    return relabeled, site_map
+
+
+def instance_to_site_map(
+    semantic_mask: np.ndarray, instance_mask: np.ndarray
+) -> dict[int, int]:
+    """Reconstruct site map from existing semantic and instance masks."""
+    site_map: dict[int, int] = {}
+    for inst_id in np.unique(instance_mask):
+        if inst_id == 0:
+            continue
+        semantic_vals = semantic_mask[instance_mask == inst_id]
+        site_map[int(inst_id)] = int(np.bincount(semantic_vals).argmax())
+    return site_map
 
 
 def prepare_case(
@@ -108,19 +132,32 @@ def prepare_case(
 
         # Process mask
         out_mask_path = out_case / f"mask_{tp}.nii.gz"
+        site_map_path = out_case / f"site_map_{tp}.json"
         if out_mask_path.exists():
             logger.info(f"  Skipping {out_mask_path.name} (already exists)")
+            # Generate site map for existing instance masks if missing
+            if not site_map_path.exists():
+                img = nib.load(mask_path)
+                semantic = np.asarray(img.dataobj).astype(np.int32)
+                instance = np.asarray(nib.load(out_mask_path).dataobj).astype(np.int32)
+                site_map = instance_to_site_map(semantic, instance)
+                with open(site_map_path, "w") as f:
+                    json.dump(site_map, f)
+                logger.info(f"  Saved {site_map_path.name} ({len(site_map)} instances)")
             continue
 
         img = nib.load(mask_path)
         mask_data = np.asarray(img.dataobj).astype(np.int32)
-        instance = semantic_to_instance(mask_data, min_size=min_size)
+        instance, site_map = semantic_to_instance(mask_data, min_size=min_size)
 
         n_components = int(instance.max())
         logger.info(f"  {mask_path.name} -> {n_components} instances")
 
         out_img = nib.Nifti1Image(instance, img.affine, img.header)
         nib.save(out_img, out_mask_path)
+        with open(site_map_path, "w") as f:
+            json.dump(site_map, f)
+        logger.info(f"  Saved {site_map_path.name} ({len(site_map)} instances)")
 
 
 def main():

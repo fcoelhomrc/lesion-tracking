@@ -101,6 +101,29 @@ def get_gt_mask_path(
     return path if path.exists() else None
 
 
+DEFAULT_DATA = (
+    Path(__file__).parent.parent.parent / "outputs" / "lesion-locator" / "data"
+)
+
+
+def load_site_map(
+    data_dir: Path, dataset: str, case_id: str, tp: str
+) -> dict[int, int] | None:
+    """Load instance_id -> disease_site mapping from prepared data."""
+    path = data_dir / dataset / case_id / f"site_map_{tp}.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        raw = json.load(f)
+    return {int(k): int(v) for k, v in raw.items()}
+
+
+def extract_lesion_id(filename: str) -> int | None:
+    """Extract lesion ID M from a filename like *_lesion_M.nii.gz."""
+    match = re.search(r"_lesion_(\d+)\.nii\.gz$", filename)
+    return int(match.group(1)) if match else None
+
+
 LABEL_NAMES = {
     1: "Omentum",
     2: "Right upper quadrant",
@@ -124,6 +147,7 @@ LABEL_NAMES = {
 def process_segment_outputs(
     segment_dir: Path,
     inputs_dir: Path,
+    data_dir: Path,
     records: list[dict],
 ) -> None:
     """Process outputs from run_segment.py.
@@ -171,13 +195,20 @@ def process_segment_outputs(
                 gt_mask, spacing = load_mask(gt_path)
                 recist = get_recist_category(inputs_dir, dataset, case_id)
 
-                # Merge per-lesion predictions into single mask
-                merged_pred = np.zeros_like(gt_mask)
+                # Load per-lesion predictions with their lesion IDs
+                pred_by_lesion: dict[int, np.ndarray] = {}
                 for pred_path in files:
+                    lesion_id = extract_lesion_id(pred_path.name)
+                    if lesion_id is None:
+                        continue
                     pred_data, _ = load_mask(pred_path)
-                    # Resize if needed (should match)
                     if pred_data.shape == gt_mask.shape:
-                        merged_pred[pred_data > 0] = 1
+                        pred_by_lesion[lesion_id] = pred_data
+
+                # Merge all predictions for patient-level metrics
+                merged_pred = np.zeros_like(gt_mask)
+                for pred_data in pred_by_lesion.values():
+                    merged_pred[pred_data > 0] = 1
 
                 # Overall binary metrics
                 metrics = compute_metrics_for_pair(merged_pred, gt_mask, spacing)
@@ -197,14 +228,34 @@ def process_segment_outputs(
                     f"dice={metrics['dice']:.3f} nsd={metrics['nsd']:.3f}"
                 )
 
-                # Per-site metrics
+                # Per-site metrics using site map
+                site_map = load_site_map(data_dir, dataset, case_id, tp)
+                if site_map is None:
+                    logger.warning(
+                        f"No site map for {dataset}/{case_id}/{tp}, skipping per-site"
+                    )
+                    continue
+
+                # Group predictions by disease site
+                preds_by_site: dict[int, np.ndarray] = {}
+                for lesion_id, pred_data in pred_by_lesion.items():
+                    site = site_map.get(lesion_id)
+                    if site is None:
+                        logger.warning(
+                            f"Lesion {lesion_id} not in site map for "
+                            f"{dataset}/{case_id}/{tp}"
+                        )
+                        continue
+                    if site not in preds_by_site:
+                        preds_by_site[site] = np.zeros_like(gt_mask)
+                    preds_by_site[site][pred_data > 0] = 1
+
                 gt_sites = np.unique(gt_mask)
                 gt_sites = gt_sites[gt_sites > 0]
                 for site in gt_sites:
+                    site = int(site)
                     gt_site = (gt_mask == site).astype(np.int32)
-                    pred_site = merged_pred.copy()
-                    # Restrict pred to voxels where GT has this site
-                    # (binary overlap in that region)
+                    pred_site = preds_by_site.get(site, np.zeros_like(gt_mask))
                     site_metrics = compute_metrics_for_pair(pred_site, gt_site, spacing)
                     site_record = {
                         "mode": "segment",
@@ -213,8 +264,8 @@ def process_segment_outputs(
                         "case_id": case_id,
                         "timepoint": tp,
                         "recist_category": recist,
-                        "site": int(site),
-                        "site_name": LABEL_NAMES.get(int(site), f"Unknown({site})"),
+                        "site": site,
+                        "site_name": LABEL_NAMES.get(site, f"Unknown({site})"),
                         **site_metrics,
                     }
                     records.append(site_record)
@@ -223,6 +274,7 @@ def process_segment_outputs(
 def process_track_outputs(
     track_dir: Path,
     inputs_dir: Path,
+    data_dir: Path,
     records: list[dict],
 ) -> None:
     """Process outputs from run_track.py.
@@ -282,11 +334,20 @@ def process_track_outputs(
                     gt_mask, spacing = load_mask(gt_path)
                     recist = get_recist_category(inputs_dir, dataset, case_id)
 
-                    merged_pred = np.zeros_like(gt_mask)
+                    # Load per-lesion predictions with their lesion IDs
+                    # Tracking uses t0 prompts, so site map comes from t0
+                    pred_by_lesion: dict[int, np.ndarray] = {}
                     for pred_path in files:
+                        lesion_id = extract_lesion_id(pred_path.name)
+                        if lesion_id is None:
+                            continue
                         pred_data, _ = load_mask(pred_path)
                         if pred_data.shape == gt_mask.shape:
-                            merged_pred[pred_data > 0] = 1
+                            pred_by_lesion[lesion_id] = pred_data
+
+                    merged_pred = np.zeros_like(gt_mask)
+                    for pred_data in pred_by_lesion.values():
+                        merged_pred[pred_data > 0] = 1
 
                     metrics = compute_metrics_for_pair(merged_pred, gt_mask, spacing)
                     record = {
@@ -305,12 +366,35 @@ def process_track_outputs(
                         f"dice={metrics['dice']:.3f} nsd={metrics['nsd']:.3f}"
                     )
 
+                    # Tracking uses t0 prompts for all follow-up timepoints
+                    site_map = load_site_map(data_dir, dataset, case_id, "t0")
+                    if site_map is None:
+                        logger.warning(
+                            f"No site map for {dataset}/{case_id}/t0, skipping per-site"
+                        )
+                        continue
+
+                    preds_by_site: dict[int, np.ndarray] = {}
+                    for lesion_id, pred_data in pred_by_lesion.items():
+                        site = site_map.get(lesion_id)
+                        if site is None:
+                            logger.warning(
+                                f"Lesion {lesion_id} not in site map for "
+                                f"{dataset}/{case_id}/t0"
+                            )
+                            continue
+                        if site not in preds_by_site:
+                            preds_by_site[site] = np.zeros_like(gt_mask)
+                        preds_by_site[site][pred_data > 0] = 1
+
                     gt_sites = np.unique(gt_mask)
                     gt_sites = gt_sites[gt_sites > 0]
                     for site in gt_sites:
+                        site = int(site)
                         gt_site = (gt_mask == site).astype(np.int32)
+                        pred_site = preds_by_site.get(site, np.zeros_like(gt_mask))
                         site_metrics = compute_metrics_for_pair(
-                            merged_pred, gt_site, spacing
+                            pred_site, gt_site, spacing
                         )
                         site_record = {
                             "mode": "track",
@@ -319,8 +403,8 @@ def process_track_outputs(
                             "case_id": case_id,
                             "timepoint": tp,
                             "recist_category": recist,
-                            "site": int(site),
-                            "site_name": LABEL_NAMES.get(int(site), f"Unknown({site})"),
+                            "site": site,
+                            "site_name": LABEL_NAMES.get(site, f"Unknown({site})"),
                             **site_metrics,
                         }
                         records.append(site_record)
@@ -343,6 +427,12 @@ def main():
         help=f"Inputs directory with GT masks (default: {DEFAULT_INPUTS})",
     )
     parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA,
+        help=f"Prepared data directory with site maps (default: {DEFAULT_DATA})",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -361,7 +451,7 @@ def main():
     if segment_dir.exists():
         configs = [d.name for d in sorted(segment_dir.iterdir()) if d.is_dir()]
         logger.info(f"Processing segmentation outputs... (configs: {configs})")
-        process_segment_outputs(segment_dir, args.inputs_dir, records)
+        process_segment_outputs(segment_dir, args.inputs_dir, args.data_dir, records)
         logger.info(f"  -> {len(records)} records so far")
     else:
         logger.warning(f"No segment dir at {segment_dir}")
@@ -371,7 +461,7 @@ def main():
     if track_dir.exists():
         configs = [d.name for d in sorted(track_dir.iterdir()) if d.is_dir()]
         logger.info(f"Processing tracking outputs... (configs: {configs})")
-        process_track_outputs(track_dir, args.inputs_dir, records)
+        process_track_outputs(track_dir, args.inputs_dir, args.data_dir, records)
         logger.info(f"  -> {len(records) - n_before} track records added")
     else:
         logger.warning(f"No track dir at {track_dir}")
