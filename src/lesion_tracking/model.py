@@ -28,28 +28,21 @@ from lesion_tracking.logger import get_logger
 logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
-# Device will be obtained from config when needed
-
-
-# TODO: Support resample to target shape instead of target spacing
-# Current LongitudinalDataset needs to be extended so we can satisfy the model hardcoded (256, 224, 224) input shape
 
 # TODO: Support configuring mask dir when scanning (e.g. using masks predicted by some model instead of manual segmentations)
 # Current structure is rigid: case/scans + case/masks, but we might have case/model_A_masks available, for example.
 
-# HACK: max_slices is hardcoded (in model, in assertion, and in the original dataset interpolation)
-# HACK: ViT assumes RGB 2D input, but CTs are grayscale, so we repeat 3 times over channel dimension
-
-
 VIT_ENCODERS = {
-    "google-16": "google/vit-base-patch16-224-in21k",
-    "google-32": "google/vit-base-patch32-224-in21k",
     "dinov2-small": "facebook/dinov2-small",
     "dinov2-base": "facebook/dinov2-base",
 }
 
-ACTIVATION_FUNC = {"gelu": nn.GELU, "relu": nn.ReLU, "leaky-relu": nn.LeakyReLU}
-
+ACTIVATION_FUNC = {
+    "gelu": nn.GELU,
+    "relu": nn.ReLU,
+    "leaky-relu": nn.LeakyReLU,
+    "silu": nn.SiLU,
+}
 
 # NOTE: Components should define their forward() methods with respect to single (case, timepoint) inputs
 # Iteration logic is a repsonsability of the caller
@@ -167,6 +160,58 @@ def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     x_complex = torch.view_as_complex(x_paired)
     x_rotated = torch.view_as_real(x_complex * freqs)
     return einops.rearrange(x_rotated, "... s d two -> ... s (d two)").to(x.dtype)
+
+
+def unpack_imaging_from_batch(
+    batch,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    imaging = batch.get("imaging")
+    assert imaging is not None, "Missing 'imaging' values from batch"
+
+    scans = imaging.get("scans")
+    masks = imaging.get("masks")
+    is_padded = imaging.get("is_padded")
+
+    assert isinstance(scans, torch.Tensor), (
+        f"Failed fetching 'scans' from batch: {type(scans)}"
+    )
+    assert isinstance(masks, torch.Tensor) or masks is None, (
+        f"Failed fetching 'masks' from batch: {type(masks)}"
+    )
+    assert isinstance(is_padded, torch.Tensor), (
+        f"Failed fetching 'is_padded' from batch: {type(is_padded)}"
+    )
+
+    assert scans.ndim == 7, (
+        f"Unexpected shape: 'scans' has {scans.shape}, expected 7 (batch, timepoints, patches, channels, x, y, z)"
+    )
+
+    if masks is not None:
+        assert scans.shape == masks.shape, (
+            f"Mismatched shapes: got {scans.shape} for 'scans', and {masks.shape} for 'masks'"
+        )
+
+    return scans, masks, is_padded
+
+
+def unpack_batch_for_classification(
+    batch,
+    target_key: str,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+
+    scans, masks, is_padded = unpack_imaging_from_batch(batch)
+
+    targets = batch.get("targets")
+    assert isinstance(targets, dict), (
+        f"Failed fetching 'targets' from batch: {type(targets)}"
+    )
+
+    targets = targets.get(target_key)
+    assert isinstance(targets, torch.Tensor), (
+        f"Failed fetching '{target_key}' from 'targets': {type(targets)}"
+    )
+
+    return scans, masks, is_padded, targets
 
 
 # =============================================================================
@@ -613,34 +658,32 @@ class BaselineScanClassifier(L.LightningModule):
             logits = self.classifier(volume_features)
             return logits
 
-    def _ingest_batch(
+    # TODO: I should define an interface, and this should be an abstract method
+    # NOTE: Comment on design
+    # The idea here is to accept that we simply need to support too many different approaches and keep flexibility
+    # to try out crazy new things. So we do ourselves a favor by keeping as much information available at input level,
+    # paying the price of added complexity on how to extract the subset of useful information for a particular approach.
+    # In this case, we minimize this effort by abstracting common operations (atm to module-level functions) that can be
+    # reused across architectures. More architecture-specific details can be implemented by extending these functions,
+    # e.g. in this case, we are not using patching, so we assume N=1 and compress the tensor.
+    def _unpack_batch(
         self, batch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        # scans/masks: (B, L, N, C, X, Y, Z)
 
-        imaging = batch.get("imaging")
-        assert imaging is not None, "Missing 'imaging' values from batch"
-        scans = imaging.get("scans")
-        masks = imaging.get("masks")
-        is_padded = imaging.get("is_padded")
-        assert scans is not None, "Missing 'scans' values from batch"
-        assert scans.shape[2] == 1, (
-            f"{self.__name__} does not support multiple patches. Found {scans.shape[2]}, expected 1"
+        scans, masks, is_padded, targets = unpack_batch_for_classification(
+            batch, target_key=self.target_key
         )
 
-        assert isinstance(masks, torch.Tensor) or masks is None
-        if masks is not None:
-            assert masks.shape[2] == 1, (
-                f"{self.__name__} does not support multiple patches. Found {masks.shape[2]}, expected 1"
-            )
-        assert scans.shape == masks.shape, (
-            f"Found incompatible scans and masks tensor: {scans.shape}, {masks.shape}"
+        # Additional validation hooks
+        # scans: B, L, N, C, X, Y, Z
+        _, _, num_patches, num_channels, _, _, _ = scans.shape
+        assert num_patches == 1, (
+            f"Patching is not supported by {self.__name__}, found {num_patches}"
         )
-
-        assert is_padded is not None, "Missing 'is_padded' values from batch"
-        assert not is_padded.any(), (
-            f"{self.__name__} does not support padded inputs, got {is_padded}"
+        assert num_channels == 1, (
+            f"Multi-channel images are not supported by {self.__name__}, found {num_channels}"
         )
+        scans = einops.rearrange(scans, "b l 1 c x y z -> b l c x y z")
 
         targets = batch.get("targets")
         assert targets is not None, "Missing 'targets' values from batch"
@@ -651,21 +694,22 @@ class BaselineScanClassifier(L.LightningModule):
         assert isinstance(targets, torch.Tensor), (
             f"Expected torch.Tensor, found {type(targets)}"
         )
+        targets = targets.float()
 
         return (
             scans,
-            targets.float(),
+            targets,
             masks,
         )
 
     def _shared_step(
-        self, batch
+        self,
+        batch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        # TODO: does not feel right to need all this validation here... what is the point of e.g. iterator helpers in dataset.py module?
-        scans, targets, masks = self._ingest_batch(batch)
+        scans, targets, masks = self._unpack_batch(batch)
 
         # Select the baseline scan
-        inputs = einops.rearrange(scans[:, 0], "b 1 c x y z -> b c x y z")
+        inputs = scans[:, 0]
 
         # TODO: use segmentation masks as attention mask
         # i.e. attn_mask[z] = any(mask[:, :, z] == 1))
@@ -907,7 +951,6 @@ def test_split_global_and_local_features():
 
 
 def test_lightning_module():
-    # FIXME: the ingest_batch must be wrong  (we validated the comps individually, but i am getting einops errors. must be a shape mismatch... i hate python)
     from lesion_tracking.config import (
         Config,
         DatasetConfig,
