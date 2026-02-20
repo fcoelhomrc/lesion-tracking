@@ -16,14 +16,13 @@ import SimpleITK as sitk
 import torch
 from skimage import measure
 
-from lesion_tracking.config import (
-    Config,
+from lesion_tracking.dataset.config import (
     DatasetConfig,
     LoaderConfig,
     PreprocessingConfig,
     make_loader,
 )
-from lesion_tracking.dataset import (
+from lesion_tracking.dataset.dataset import (
     LongitudinalDataset,
     extract_body,
     iterate_over_cases,
@@ -569,26 +568,24 @@ def main() -> None:
     # extract_body needs raw HU values; otherwise use soft_tissue directly
     normalization = "hu_units" if args.extract_body else "soft_tissue"
 
-    cfg = Config(
-        dataset=DatasetConfig(
-            dataset_path=str(args.dataset),
-            allow_missing_scans=False,
-            allow_missing_masks=False,
-            enable_augmentations=False,
-        ),
-        preprocessing=PreprocessingConfig(
-            normalization=normalization,
-            target_size=tuple(args.target_size),
-            spacing=tuple(args.spacing),
-        ),
-        loader=LoaderConfig(
-            cases_per_batch=1,
-            num_workers=0,
-        ),
+    dataset_cfg = DatasetConfig(
+        dataset_path=str(args.dataset),
+        allow_missing_scans=False,
+        allow_missing_masks=False,
+        enable_augmentations=False,
+    )
+    preprocessing_cfg = PreprocessingConfig(
+        normalization=normalization,
+        target_size=tuple(args.target_size),
+        spacing=tuple(args.spacing),
+    )
+    loader_cfg = LoaderConfig(
+        cases_per_batch=1,
+        num_workers=0,
     )
 
     logger.info("Loading dataset...")
-    loader = make_loader(cfg)
+    loader = make_loader(dataset_cfg, preprocessing_cfg, loader_cfg)
     logger.info(f"Found {len(loader)} cases")
 
     if isinstance(loader.dataset, LongitudinalDataset):

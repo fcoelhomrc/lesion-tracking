@@ -14,7 +14,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from lesion_tracking.dataset import (
+from lesion_tracking.dataset.dataset import (
     get_loader,
     iterate_over_timepoints,
     without_channel,
