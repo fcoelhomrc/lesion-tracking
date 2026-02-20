@@ -13,3 +13,4 @@ wheels/
 .cache/
 inputs/
 outputs/
+scripts/pathology-crossref/
