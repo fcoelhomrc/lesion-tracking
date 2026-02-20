@@ -158,7 +158,7 @@ def main():
     if args.extract_body:
         import torch
 
-        from lesion_tracking.dataset import extract_body
+        from lesion_tracking.dataset.dataset import extract_body
 
         scan_5d = torch.from_numpy(scan)[None, None]  # (1, 1, X, Y, Z)
         scan = extract_body(scan_5d)[0, 0].numpy()
