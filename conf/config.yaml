@@ -1,6 +1,0 @@
-defaults:
-  - dataset: default
-  - preprocessing: default
-  - loader: default
-  - model: default
-  - training: default

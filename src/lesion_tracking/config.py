@@ -8,23 +8,7 @@ from lesion_tracking.dataset.config import (
     PreprocessingConfig,
 )
 from lesion_tracking.model.config import ClassificationModuleConfig
-from lesion_tracking.training.config import SchedulerConfig
-
-
-@dataclass
-class TrainingConfig:
-    max_epochs: int = 50
-    lr: float = 1e-4
-    weight_decay: float = 1e-5
-    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    enable_checkpointing: bool = True
-    enable_lr_monitor: bool = True
-    early_stopping_monitor: str = "val/loss"
-    early_stopping_patience: int = 10
-    early_stopping_mode: str = "min"
-    checkpoint_monitor: str = "val/auroc"
-    checkpoint_mode: str = "max"
-    checkpoint_save_top_k: int = 1
+from lesion_tracking.training.config import TrainingConfig
 
 
 @dataclass
@@ -39,9 +23,9 @@ class Config:
 
 
 cs = ConfigStore.instance()
-cs.store(name="config", node=Config)
-cs.store(group="dataset", name="default", node=DatasetConfig)
-cs.store(group="preprocessing", name="default", node=PreprocessingConfig)
-cs.store(group="loader", name="default", node=LoaderConfig)
-cs.store(group="model", name="default", node=ClassificationModuleConfig)
-cs.store(group="training", name="default", node=TrainingConfig)
+cs.store(name="base_config", node=Config)
+cs.store(group="dataset", name="base_dataset", node=DatasetConfig)
+cs.store(group="preprocessing", name="base_preprocessing", node=PreprocessingConfig)
+cs.store(group="loader", name="base_loader", node=LoaderConfig)
+cs.store(group="model", name="base_model", node=ClassificationModuleConfig)
+cs.store(group="training", name="base_training", node=TrainingConfig)
