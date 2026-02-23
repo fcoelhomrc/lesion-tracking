@@ -131,7 +131,6 @@ class BaselineScanClassifier(L.LightningModule):
         assert isinstance(targets, torch.Tensor), (
             f"Expected torch.Tensor, found {type(targets)}"
         )
-        targets = targets.float()
 
         return (
             scans,
@@ -176,8 +175,16 @@ class BaselineScanClassifier(L.LightningModule):
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
         loss, probs, targets, attn_weights = self._shared_step(batch)
-        self.train_metrics.update(probs, targets.int())
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        bs = targets.shape[0]
+        self.train_metrics.update(probs, targets)
+        self.log(
+            "train/loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=bs,
+        )
         return loss
 
     def on_train_epoch_end(self):
@@ -186,8 +193,11 @@ class BaselineScanClassifier(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         loss, probs, targets, attn_weights = self._shared_step(batch)
-        self.val_metrics.update(probs, targets.int())
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        bs = targets.shape[0]
+        self.val_metrics.update(probs, targets)
+        self.log(
+            "val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs
+        )
         return loss
 
     def on_validation_epoch_end(self):
@@ -390,7 +400,6 @@ def test_split_global_and_local_features():
 
 
 def test_lightning_module():
-    from lesion_tracking.config import TrainingConfig
     from lesion_tracking.dataset.config import (
         DatasetConfig,
         LoaderConfig,
@@ -402,7 +411,7 @@ def test_lightning_module():
         PoolingConfig,
         make_classification_module,
     )
-    from lesion_tracking.training.config import make_callbacks
+    from lesion_tracking.training.config import TrainingConfig, make_callbacks
 
     dataset_cfg = DatasetConfig(
         dataset_path="inputs/neov",
