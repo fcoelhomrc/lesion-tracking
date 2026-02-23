@@ -135,6 +135,9 @@ class AttentionBasedPooling(nn.Module):
                 build_rope_frequencies(hidden_size, theta=rope_theta),
                 persistent=False,
             )
+            assert isinstance(self.rope_freqs, torch.Tensor), (
+                f"Expected 'rope_freqs' to be torch.Tensor, got {type(self.rope_freqs)}"
+            )
 
     @property
     def return_attention(self):
@@ -169,8 +172,8 @@ class AttentionBasedPooling(nn.Module):
         # I think relative PE makes more sense, because a fixed slice z might capture different anatomical regions,
         # depending on (i) scan original shape, and (ii) scan original spacing.
         if self.use_rope:
-            Q = apply_rope(Q, self.rope_freqs)
-            K = apply_rope(K, self.rope_freqs)
+            Q = apply_rope(Q, self.rope_freqs)  # type: ignore
+            K = apply_rope(K, self.rope_freqs)  # type: ignore
 
         # (B, Z) -> (B, 1, Z) additive mask for attention logits
         # Broadcast along query dimension (the same keys are masked for every query)

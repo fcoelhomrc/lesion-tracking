@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from lesion_tracking.training.config import TrainingConfig
+
 if TYPE_CHECKING:
     from lesion_tracking.model.classifier import BaselineScanClassifier
-    from lesion_tracking.training.config import TrainingConfig
 
 
 @dataclass
