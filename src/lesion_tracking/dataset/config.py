@@ -24,7 +24,7 @@ class DatasetConfig:
     allow_missing_scans: bool = False
     allow_missing_masks: bool = False
     task: str | None = None
-    drop_missing_targets: bool = False
+    drop_missing_targets: bool = True
     feature_groups: list[str] | None = None
     caching_strategy: str | None = "disk"
     cache_dir: str | None = None
@@ -34,10 +34,8 @@ class DatasetConfig:
 @dataclass
 class LoaderConfig:
     cases_per_batch: int = 1
-    shuffle: bool = False
     num_workers: int = 1
     fold: int | None = None
-    split: str | None = None  # "train", "val", or "test"
 
 
 def make_dataset(
@@ -66,6 +64,8 @@ def make_loader(
     dataset_cfg: DatasetConfig,
     preprocessing_cfg: PreprocessingConfig,
     loader_cfg: LoaderConfig,
+    split: str | None = None,
+    shuffle: bool = False,
 ):
     return get_loader(
         dataset_path=dataset_cfg.dataset_path,
@@ -82,8 +82,8 @@ def make_loader(
         allow_missing_scans=dataset_cfg.allow_missing_scans,
         allow_missing_masks=dataset_cfg.allow_missing_masks,
         cases_per_batch=loader_cfg.cases_per_batch,
-        shuffle=loader_cfg.shuffle,
+        shuffle=shuffle,
         num_workers=loader_cfg.num_workers,
         fold=loader_cfg.fold,
-        split=loader_cfg.split,
+        split=split,
     )

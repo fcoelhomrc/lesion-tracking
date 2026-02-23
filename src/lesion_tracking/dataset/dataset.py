@@ -189,7 +189,9 @@ def _validate_and_fingerprint(
             # Collect shape/spacing from scans only (masks share the same grid)
             if nifti_path is scan:
                 header = img.header
-                all_shapes.append(list(header.get_data_shape()))
+                all_shapes.append(
+                    list(header.get_data_shape())
+                )  # NOTE: can't validate if these methods are present, because header type is defined dynamically
                 all_spacings.append([float(s) for s in header.get_zooms()])
 
     if not all_shapes:
@@ -294,6 +296,7 @@ def scan_dataset_dir(
 
     cases = sorted(cases)
     flat_items = sorted(flat_items, key=lambda x: (x[0], x[1]))
+    logger.debug(f"Scanned {len(flat_items)} items")
 
     _validate_and_fingerprint(flat_items, cases, path)
 
@@ -498,8 +501,10 @@ class LongitudinalDataset(Dataset):
             dropped = before - len(flat_items)
             if dropped > 0:
                 logger.info(
-                    f"Dropped {dropped} items with missing targets for task '{self._task.name}'"
+                    f"Dropped {dropped}/{before} items with missing targets for task '{self._task.name}'"
                 )
+            remaining_case_ids = {item[0] for item in flat_items}
+            self._cases = [c for c in self._cases if c in remaining_case_ids]
 
         self._flat_items = [
             (case_id, tp, idx) for idx, (case_id, tp, _, _) in enumerate(flat_items)
@@ -512,6 +517,8 @@ class LongitudinalDataset(Dataset):
     def _has_target(self, case_id: str, metadata: dict) -> bool:
         case_metadata = metadata.get(case_id)
         if case_metadata is None:
+            return False
+        if self._task is None:
             return False
         try:
             parsed = parse_metadata(case_metadata, self._task.keys)
@@ -533,6 +540,10 @@ class LongitudinalDataset(Dataset):
     @property
     def case_ids(self) -> list[str]:
         return self._cases
+
+    @property
+    def task(self) -> TaskDef | None:
+        return self._task
 
     def subset_by_cases(self, case_ids: list[str]) -> "LongitudinalDataset":
         """
@@ -1069,24 +1080,33 @@ def generate_folds(
     test_size: float = 0.5,
     num_folds: int = 5,  # Non-overlapping folds!
     seed: int = 0,
-    stratified: bool = False,
     stratification_key: str | None = None,
 ) -> None:
     """
     Pre-computes folds and save them to file for later use.
+
+    Different stratification schemes are simultaneously supported by registering the stratification key to the JSON:
+        {<stratification_key>} -> {"train": [...], "val": [...], "test": [...]}
+
+    We use "null" to represent unstratified folds, which is often used as a fallback when loading folds.
     """
     import json
 
     from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 
     folds_json = Path(dataset_path) / "folds.json"
-    if folds_json.exists() and not overwrite:
-        logger.warning(
-            f"Found existing folds at {str(folds_json)}! Skipping operation..."
-        )
-        return
-    if folds_json.exists() and overwrite:
-        logger.debug(f"Overwriting {str(folds_json)}...")
+    top_key = stratification_key or "null"
+
+    existing = {}
+    if folds_json.exists():
+        existing = json.load(folds_json.open())
+        if top_key in existing and not overwrite:
+            logger.warning(
+                f"Folds for '{top_key}' already exist in {folds_json}. Skipping."
+            )
+            return
+        if top_key in existing and overwrite:
+            logger.debug(f"Overwriting folds for '{top_key}' in {folds_json}...")
 
     assert 0.0 < test_size < 1.0, f"Test size must be between 0 and 1, got {test_size}"
 
@@ -1102,14 +1122,9 @@ def generate_folds(
     )
 
     num_cases = len(cases)
-    results = {
-        "stratified": stratified,
-        "stratification_key": stratification_key,
-    }  # fold: {train, val, test}
+    fold_results = {}
 
-    if stratified:
-        assert stratification_key is not None, "Stratification key was not provided."
-
+    if stratification_key is not None:
         case_metadata = [metadata.get(case) for case in cases]
 
         # Keep only cases that provide the specified stratification key
@@ -1150,7 +1165,7 @@ def generate_folds(
             train_indices = np.asarray(train_val_indices)[train_indices].tolist()
             val_indices = np.asarray(train_val_indices)[val_indices].tolist()
             # Store fold in a human-readable format
-            results[str(i)] = {
+            fold_results[str(i)] = {
                 "train": [cases[j] for j in train_indices],
                 "val": [cases[j] for j in val_indices],
                 "test": [cases[j] for j in test_indices],
@@ -1173,24 +1188,45 @@ def generate_folds(
             train_indices = np.asarray(train_val_indices)[train_indices].tolist()
             val_indices = np.asarray(train_val_indices)[val_indices].tolist()
             # Store fold in a human-readable format
-            results[str(i)] = {
+            fold_results[str(i)] = {
                 "train": [cases[j] for j in train_indices],
                 "val": [cases[j] for j in val_indices],
                 "test": [cases[j] for j in test_indices],
             }
 
-    json.dump(results, folds_json.open("w"), indent=2)
+    existing[top_key] = fold_results
+    json.dump(existing, folds_json.open("w"), indent=2)
     return
 
 
-def load_folds(dataset_path: str | Path, fold: int, split: str) -> list[str]:
+def load_folds(
+    dataset_path: str | Path,
+    fold: int,
+    split: str,
+    stratification_key: str | None = None,
+) -> list[str]:
     folds_json = Path(dataset_path) / "folds.json"
-    folds = json.load(folds_json.open())
-    train_val_test: dict | None = folds.get(str(fold))
-    assert train_val_test is not None, f"Fold {fold} not found in {str(folds_json)}"
-    assert isinstance(train_val_test, dict), "Failed loading folds. Check format."
+    all_folds = json.load(folds_json.open())
+
+    top_key = stratification_key or "null"
+    fold_group = all_folds.get(top_key)
+    if fold_group is None and stratification_key is not None:
+        logger.warning(
+            f"No folds stratified by '{stratification_key}' in {folds_json}, "
+            f"falling back to unstratified folds."
+        )
+        top_key = "null"
+        fold_group = all_folds.get(top_key)
+    assert fold_group is not None, (
+        f"No folds for '{top_key}' in {folds_json}. Available: {list(all_folds.keys())}"
+    )
+
+    train_val_test = fold_group.get(str(fold))
+    assert train_val_test is not None, (
+        f"Fold {fold} not found under '{top_key}' in {folds_json}"
+    )
     assert split in train_val_test, (
-        f"Missing split {split} in fold {fold} (Available: {[s for s in train_val_test]})"
+        f"Missing split {split} in fold {fold} (Available: {list(train_val_test.keys())})"
     )
     return train_val_test[split]
 
@@ -1233,9 +1269,19 @@ def get_loader(
     )
 
     if fold is not None:
-        assert split is not None
-        case_ids = load_folds(dataset_path, fold=fold, split=split)
-        logger.info(f"Loading {split} split (fold {fold})")
+        assert split is not None, f"No split was specified for fold {fold}"
+        task_def = dataset.task
+        if task_def is not None and len(task_def.keys) == 1:
+            stratification_key = task_def.keys[0]
+        else:
+            stratification_key = None
+        case_ids = load_folds(
+            dataset_path,
+            fold=fold,
+            split=split,
+            stratification_key=stratification_key,
+        )
+        logger.info(f"Loading {split} split (fold {fold}, key='{stratification_key}')")
         dataset.subset_by_cases(case_ids)
 
     batch_sampler = CaseGroupedBatchSampler(
@@ -1350,7 +1396,6 @@ if __name__ == "__main__":
     #     overwrite=True,
     #     test_size=0.2,
     #     num_folds=2,
-    #     stratified=True,
     #     stratification_key="treatment.chemotherapy_response_score",
     # )
 
