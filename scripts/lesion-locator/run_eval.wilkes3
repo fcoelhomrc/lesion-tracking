@@ -20,8 +20,8 @@
 #SBATCH --nodes=1
 #! How many (MPI) tasks will there be in total?
 #SBATCH --ntasks=1
-#! Request 24 GB memory (single-process Python, just need RAM)
-#SBATCH --mem=24000
+#! Request 48 GB memory (single-process Python, just need RAM)
+#SBATCH --mem=48000
 #! How much wallclock time will be required?
 #SBATCH --time=06:00:00
 #! What types of email messages do you wish to receive?
