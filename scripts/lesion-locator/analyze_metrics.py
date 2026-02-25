@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from lesion_tracking.logger import get_logger
+from lesion_tracking.logger import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
@@ -934,6 +934,7 @@ def print_patient_ranking(
 
 
 def main():
+    setup_logging()
     parser = argparse.ArgumentParser(
         description="Analyze LesionLocator evaluation metrics"
     )

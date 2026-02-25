@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from monai.metrics import compute_dice, compute_surface_dice
 
-from lesion_tracking.logger import get_logger
+from lesion_tracking.logger import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
@@ -411,6 +411,7 @@ def process_track_outputs(
 
 
 def main():
+    setup_logging()
     parser = argparse.ArgumentParser(
         description="Compute metrics for LesionLocator predictions"
     )

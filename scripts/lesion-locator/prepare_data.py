@@ -15,7 +15,7 @@ import nibabel as nib
 import numpy as np
 from monai.transforms import RemoveSmallObjects
 
-from lesion_tracking.logger import get_logger
+from lesion_tracking.logger import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
@@ -161,6 +161,7 @@ def prepare_case(
 
 
 def main():
+    setup_logging()
     parser = argparse.ArgumentParser(
         description="Prepare data for LesionLocator evaluation"
     )
