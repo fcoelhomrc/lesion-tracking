@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import abc
 from typing import Callable
 
 import einops
@@ -8,16 +9,7 @@ import torch
 import torch.nn as nn
 
 from lesion_tracking.logger import get_logger
-from lesion_tracking.model.config import (
-    MLPStackConfig,
-    PoolingConfig,
-)
 from lesion_tracking.model.functional import unpack_batch_for_classification
-from lesion_tracking.model.modules import (
-    AttentionBasedPooling,
-    MLPStack,
-    SliceBasedVolumeEncoder,
-)
 from lesion_tracking.training.config import (
     SchedulerConfig,
     make_metrics,
@@ -31,21 +23,23 @@ logger.setLevel("DEBUG")
 # Current structure is rigid: case/scans + case/masks, but we might have case/model_A_masks available, for example.
 
 
-class BaselineScanClassifier(L.LightningModule):
+class BaseClassifier(L.LightningModule, abc.ABC):
     def __init__(
         self,
         target_key: str,
-        backbone: str,
-        freeze_backbone: bool,
         num_classes: int,
-        pooling: PoolingConfig,
-        classifier: MLPStackConfig,
+        encoder: nn.Module,
+        pooling: nn.Module,
+        classifier: nn.Module,
         scheduler: SchedulerConfig,
         lr: float,
         weight_decay: float,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["encoder", "pooling", "classifier"])
+        self.hparams["encoder"] = type(encoder).__name__
+        self.hparams["pooling"] = type(pooling).__name__
+        self.hparams["classifier"] = type(classifier).__name__
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -57,24 +51,9 @@ class BaselineScanClassifier(L.LightningModule):
             nn.BCEWithLogitsLoss() if num_classes <= 2 else nn.CrossEntropyLoss()
         )
 
-        self.encoder = SliceBasedVolumeEncoder(
-            backbone=backbone, freeze=freeze_backbone
-        )
-        self.pooling = AttentionBasedPooling(
-            hidden_size=self.encoder.hidden_size,
-            dropout=pooling.dropout,
-            return_attention=pooling.return_attention,
-            use_rope=pooling.use_rope,
-            rope_theta=pooling.rope_theta,
-        )
-        self.classifier = MLPStack(
-            input_dim=self.encoder.hidden_size,
-            output_dim=num_classes,
-            num_hidden_layers=classifier.num_hidden_layers,
-            hidden_dim=classifier.hidden_dim,
-            dropout_rate=classifier.dropout_rate,
-            activation=classifier.activation,
-        )
+        self.encoder = encoder
+        self.pooling = pooling
+        self.classifier = classifier
 
         self.train_metrics = make_metrics(num_classes, prefix="train/")
         self.val_metrics = make_metrics(num_classes, prefix="val/")
@@ -83,19 +62,12 @@ class BaselineScanClassifier(L.LightningModule):
         self,
         inputs: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         cls_token, _ = self.encoder(inputs)
+        volume_features, attn_weights = self.pooling(cls_token, attn_mask=attn_mask)
+        logits = self.classifier(volume_features)
+        return logits, attn_weights
 
-        if self.pooling.return_attention:
-            volume_features, attn_scores = self.pooling(cls_token, attn_mask=attn_mask)
-            logits = self.classifier(volume_features)
-            return logits, attn_scores
-        else:
-            volume_features = self.pooling(cls_token, attn_mask=attn_mask)
-            logits = self.classifier(volume_features)
-            return logits
-
-    # TODO: I should define an interface, and this should be an abstract method
     # NOTE: Comment on design
     # The idea here is to accept that we simply need to support too many different approaches and keep flexibility
     # to try out crazy new things. So we do ourselves a favor by keeping as much information available at input level,
@@ -103,65 +75,26 @@ class BaselineScanClassifier(L.LightningModule):
     # In this case, we minimize this effort by abstracting common operations (atm to module-level functions) that can be
     # reused across architectures. More architecture-specific details can be implemented by extending these functions,
     # e.g. in this case, we are not using patching, so we assume N=1 and compress the tensor.
+    @abc.abstractmethod
     def _unpack_batch(
         self, batch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Extract (inputs, targets, attn_mask) from a batch.
 
-        scans, masks, is_padded, targets = unpack_batch_for_classification(
-            batch, target_key=self.target_key
-        )
-
-        # Additional validation hooks
-        # scans: B, L, N, C, X, Y, Z
-        _, _, num_patches, num_channels, _, _, _ = scans.shape
-        assert num_patches == 1, (
-            f"Patching is not supported by {self.__name__}, found {num_patches}"
-        )
-        assert num_channels == 1, (
-            f"Multi-channel images are not supported by {self.__name__}, found {num_channels}"
-        )
-        scans = einops.rearrange(scans, "b l 1 c x y z -> b l c x y z")
-
-        targets = batch.get("targets")
-        assert targets is not None, "Missing 'targets' values from batch"
-        assert self.target_key in targets, (
-            f"Missing '{self.target_key}' in targets {list(targets.keys())}"
-        )
-        targets = targets[self.target_key]
-        assert isinstance(targets, torch.Tensor), (
-            f"Expected torch.Tensor, found {type(targets)}"
-        )
-
-        return (
-            scans,
-            targets,
-            masks,
-        )
+        Returns:
+            inputs: tensor ready for forward()
+            targets: ground truth labels
+            attn_mask: optional attention mask, or None
+        """
+        ...
 
     def _shared_step(
         self,
         batch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        scans, targets, masks = self._unpack_batch(batch)
+        inputs, targets, attn_mask = self._unpack_batch(batch)
 
-        # Select the baseline scan
-        inputs = scans[:, 0]
-
-        # TODO: use segmentation masks as attention mask
-        # i.e. attn_mask[z] = any(mask[:, :, z] == 1))
-        if masks is not None:
-            # Select baseline mask
-            attn_mask = einops.rearrange(masks[:, 0], "b 1 1 x y z -> b x y z")
-            # Do not attend to z-slices that don't have lesion
-            attn_mask = einops.reduce(attn_mask > 0, "b x y z -> b z", "any")
-        else:
-            attn_mask = None
-
-        if self.pooling.return_attention:
-            logits, attn_weights = self(inputs, attn_mask)
-        else:
-            logits = self(inputs, attn_mask)
-            attn_weights = None
+        logits, attn_weights = self(inputs, attn_mask)
 
         if self.num_classes <= 2:
             logits = einops.rearrange(logits, "b 1 -> b")
@@ -214,6 +147,50 @@ class BaselineScanClassifier(L.LightningModule):
             self.trainer.max_epochs,  # type: ignore
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+
+class BaselineScanClassifier(BaseClassifier):
+    def _unpack_batch(
+        self, batch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+
+        scans, masks, is_padded, targets = unpack_batch_for_classification(
+            batch, target_key=self.target_key
+        )
+
+        # scans: B, L, N, C, X, Y, Z
+        _, _, num_patches, num_channels, _, _, _ = scans.shape
+        assert num_patches == 1, (
+            f"Patching is not supported by {type(self).__name__}, found {num_patches}"
+        )
+        assert num_channels == 1, (
+            f"Multi-channel images are not supported by {type(self).__name__}, found {num_channels}"
+        )
+        scans = einops.rearrange(scans, "b l 1 c x y z -> b l c x y z")
+
+        targets = batch.get("targets")
+        assert targets is not None, "Missing 'targets' values from batch"
+        assert self.target_key in targets, (
+            f"Missing '{self.target_key}' in targets {list(targets.keys())}"
+        )
+        targets = targets[self.target_key]
+        assert isinstance(targets, torch.Tensor), (
+            f"Expected torch.Tensor, found {type(targets)}"
+        )
+
+        # Select the baseline scan
+        inputs = scans[:, 0]
+
+        # Build z-slice attention mask from segmentation masks
+        if masks is not None:
+            # Select baseline mask
+            attn_mask = einops.rearrange(masks[:, 0], "b 1 1 x y z -> b x y z")
+            # Do not attend to z-slices that don't have lesion
+            attn_mask = einops.reduce(attn_mask > 0, "b x y z -> b z", "any")
+        else:
+            attn_mask = None
+
+        return inputs, targets, attn_mask
 
 
 # =============================================================================

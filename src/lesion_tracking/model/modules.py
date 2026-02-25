@@ -148,7 +148,7 @@ class AttentionBasedPooling(nn.Module):
         inputs: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         return_attention: bool | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Input:
         inputs: (B, Z, H)
@@ -156,7 +156,7 @@ class AttentionBasedPooling(nn.Module):
 
         Output:
         pooled: (B, H)
-        attn_weights: (B, Z, Z) if returning attention
+        attn_weights: (B, Z, Z) or None
         """
         want_attention = (
             return_attention if return_attention is not None else self.return_attention
@@ -193,7 +193,7 @@ class AttentionBasedPooling(nn.Module):
                 attn_mask=additive_mask,
                 dropout_p=self.dropout.p if self.training else 0.0,
             )
-            return self._masked_mean_pool(pooled, attn_mask)
+            return self._masked_mean_pool(pooled, attn_mask), None
 
         # Batched matmul - Q @ K^T -> shape: (B, Z, Z)
         scores = einops.einsum(Q, K, "b i k, b j k -> b i j") / self.scale
