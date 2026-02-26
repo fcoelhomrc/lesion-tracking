@@ -308,7 +308,13 @@ class TaskDef:
     name: str
     keys: list[str]  # paths into metadata
     task_type: Literal["classification", "survival"]
-    num_classes: int | None = None
+    label_map: dict | None = None  # raw metadata value -> class index
+
+    @property
+    def num_classes(self) -> int | None:
+        if self.label_map is None:
+            return None
+        return len(set(self.label_map.values()))
 
 
 TASKS = {
@@ -316,13 +322,13 @@ TASKS = {
         name="crs",
         keys=["treatment.chemotherapy_response_score"],
         task_type="classification",
-        num_classes=3,
+        label_map={1: 0, 2: 1, 3: 2},
     ),
     "recist": TaskDef(
         name="recist",
         keys=["imaging.recist_category"],
         task_type="classification",
-        num_classes=4,
+        label_map={1: 0, 2: 1, 3: 2, 4: 3},
     ),
     "survival": TaskDef(
         name="survival",
@@ -592,6 +598,8 @@ class LongitudinalDataset(Dataset):
             case_metadata = self._metadata.get(case_id)
             if case_metadata is not None:
                 target = parse_metadata(case_metadata, self._task.keys)
+                if target is not None and self._task.label_map is not None:
+                    target = {k: self._task.label_map[v] for k, v in target.items()}
 
         features = None
         if self._feature_groups:
