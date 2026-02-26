@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import abc
-from typing import Callable
-
 import einops
 import lightning as L
 import torch
 import torch.nn as nn
 
-from lesion_tracking.logger import get_logger
-from lesion_tracking.model.functional import unpack_batch_for_classification
+from lesion_tracking.logger import get_logger, setup_logging
 from lesion_tracking.training.config import (
     SchedulerConfig,
     make_metrics,
@@ -23,79 +19,130 @@ logger.setLevel("DEBUG")
 # Current structure is rigid: case/scans + case/masks, but we might have case/model_A_masks available, for example.
 
 
-class BaseClassifier(L.LightningModule, abc.ABC):
+class PairedTimepointClassifier(L.LightningModule):
     def __init__(
         self,
-        target_key: str,
         num_classes: int,
         encoder: nn.Module,
         pooling: nn.Module,
         classifier: nn.Module,
-        scheduler: SchedulerConfig,
+        strategy: str,
+        target_key: str,
         lr: float,
         weight_decay: float,
+        scheduler_cfg: SchedulerConfig,
+        cross_attn: nn.Module | None = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["encoder", "pooling", "classifier"])
-        self.hparams["encoder"] = type(encoder).__name__
-        self.hparams["pooling"] = type(pooling).__name__
-        self.hparams["classifier"] = type(classifier).__name__
-
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.scheduler_cfg = scheduler
-        self.num_classes = num_classes
-        self.target_key = target_key
-
-        self.loss_fn: Callable[..., torch.Tensor] = (
-            nn.BCEWithLogitsLoss() if num_classes <= 2 else nn.CrossEntropyLoss()
+        self.save_hyperparameters(
+            {
+                "num_classes": num_classes,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "scheduler": scheduler_cfg.name,
+                "encoder": type(encoder).__name__,
+                "pooling": type(pooling).__name__,
+                "classifier": type(classifier).__name__,
+                "strategy": strategy,
+            }
         )
 
+        self.num_classes = num_classes
         self.encoder = encoder
         self.pooling = pooling
         self.classifier = classifier
+        self.cross_attn = cross_attn
+        self.strategy = strategy
+        self.target_key = target_key
 
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.scheduler_cfg = scheduler_cfg
+
+        self.loss_fn: nn.Module = (
+            nn.BCEWithLogitsLoss() if num_classes <= 2 else nn.CrossEntropyLoss()
+        )
         self.train_metrics = make_metrics(num_classes, prefix="train/")
         self.val_metrics = make_metrics(num_classes, prefix="val/")
+
+    def prepare_batch(
+        self, batch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Unpack a DataLoader batch into (inputs, targets, attn_mask)."""
+        imaging = batch["imaging"]
+        scans: torch.Tensor = imaging["scans"]
+        masks: torch.Tensor | None = imaging["masks"]
+
+        # scans: B, L, N, C, X, Y, Z — expect single channel, no patching
+        _, _, num_patches, num_channels, _, _, _ = scans.shape
+        assert num_channels == 1, f"Expected 1, got {num_channels} channels"
+        assert num_patches == 1, f"Expected 1, got {num_patches} patches"
+
+        # Squeeze patching dim (N=1), keep channel
+        inputs = einops.rearrange(scans, "b l 1 c x y z -> b l c x y z")
+
+        # Build z-slice attention mask from segmentation masks
+        if masks is not None:
+            attn_mask = einops.rearrange(masks, "b l 1 1 x y z -> b l x y z")
+            attn_mask = einops.reduce(attn_mask > 0, "b l x y z -> b l z", "any")
+        else:
+            attn_mask = None
+
+        targets: torch.Tensor = batch["targets"][self.target_key]
+        return inputs, targets, attn_mask
 
     def forward(
         self,
         inputs: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        cls_token, _ = self.encoder(inputs)
-        volume_features, attn_weights = self.pooling(cls_token, attn_mask=attn_mask)
-        logits = self.classifier(volume_features)
-        return logits, attn_weights
 
-    # NOTE: Comment on design
-    # The idea here is to accept that we simply need to support too many different approaches and keep flexibility
-    # to try out crazy new things. So we do ourselves a favor by keeping as much information available at input level,
-    # paying the price of added complexity on how to extract the subset of useful information for a particular approach.
-    # In this case, we minimize this effort by abstracting common operations (atm to module-level functions) that can be
-    # reused across architectures. More architecture-specific details can be implemented by extending these functions,
-    # e.g. in this case, we are not using patching, so we assume N=1 and compress the tensor.
-    @abc.abstractmethod
-    def _unpack_batch(
-        self, batch
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Extract (inputs, targets, attn_mask) from a batch.
+        # Pre-treatment scan (t = 0)
+        cls_token, _ = self.encoder(inputs[:, 0])
+        pre_features, pre_attn_weights = self.pooling(
+            cls_token, attn_mask=attn_mask[:, 0] if attn_mask is not None else None
+        )
 
-        Returns:
-            inputs: tensor ready for forward()
-            targets: ground truth labels
-            attn_mask: optional attention mask, or None
-        """
-        ...
+        if self.strategy == "only_pre":
+            logits = self.classifier(pre_features)
+            return logits, pre_attn_weights
 
-    def _shared_step(
-        self,
-        batch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        inputs, targets, attn_mask = self._unpack_batch(batch)
+        # Post-treatment scan (t = T - 1)
+        cls_token, _ = self.encoder(inputs[:, -1])
+        post_features, post_attn_weights = self.pooling(
+            cls_token, attn_mask=attn_mask[:, -1] if attn_mask is not None else None
+        )
 
-        logits, attn_weights = self(inputs, attn_mask)
+        if self.strategy == "diff":
+            treatment_features = post_features - pre_features
 
+        elif self.strategy == "mean":
+            treatment_features = 0.5 * (pre_features + post_features)
+
+        elif self.strategy == "concat":
+            treatment_features, ps = einops.pack(
+                [pre_features, post_features],
+                "b *",
+            )  # b h + b h -> b 2h
+
+        elif self.strategy == "cross_attn":
+            assert self.cross_attn is not None
+            treatment_features = self.cross_attn(
+                pre_features=pre_features,
+                post_features=post_features,
+            )
+
+        else:
+            raise ValueError
+
+        logits = self.classifier(treatment_features)
+
+        # FIXME: Decide how to return the attn weights in this case
+        return logits, pre_attn_weights
+
+    def _compute_loss(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_classes <= 2:
             logits = einops.rearrange(logits, "b 1 -> b")
             probs = torch.sigmoid(logits)
@@ -103,11 +150,16 @@ class BaseClassifier(L.LightningModule, abc.ABC):
         else:
             probs = torch.softmax(logits, dim=-1)
             loss = self.loss_fn(logits, targets.long())
+        return loss, probs
 
-        return loss, probs, targets, attn_weights
+    def _shared_step(self, batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        inputs, targets, attn_mask = self.prepare_batch(batch)
+        logits, _ = self(inputs, attn_mask)
+        loss, probs = self._compute_loss(logits, targets)
+        return loss, probs, targets
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
-        loss, probs, targets, attn_weights = self._shared_step(batch)
+        loss, probs, targets = self._shared_step(batch)
         bs = targets.shape[0]
         self.train_metrics.update(probs, targets)
         self.log(
@@ -125,11 +177,16 @@ class BaseClassifier(L.LightningModule, abc.ABC):
         self.train_metrics.reset()
 
     def validation_step(self, batch, batch_idx):
-        loss, probs, targets, attn_weights = self._shared_step(batch)
+        loss, probs, targets = self._shared_step(batch)
         bs = targets.shape[0]
         self.val_metrics.update(probs, targets)
         self.log(
-            "val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs
+            "val/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=bs,
         )
         return loss
 
@@ -147,55 +204,6 @@ class BaseClassifier(L.LightningModule, abc.ABC):
             self.trainer.max_epochs,  # type: ignore
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
-
-
-class BaselineScanClassifier(BaseClassifier):
-    def _unpack_batch(
-        self, batch
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-
-        scans, masks, is_padded, targets = unpack_batch_for_classification(
-            batch, target_key=self.target_key
-        )
-
-        # scans: B, L, N, C, X, Y, Z
-        _, _, num_patches, num_channels, _, _, _ = scans.shape
-        assert num_patches == 1, (
-            f"Patching is not supported by {type(self).__name__}, found {num_patches}"
-        )
-        assert num_channels == 1, (
-            f"Multi-channel images are not supported by {type(self).__name__}, found {num_channels}"
-        )
-        scans = einops.rearrange(scans, "b l 1 c x y z -> b l c x y z")
-
-        targets = batch.get("targets")
-        assert targets is not None, "Missing 'targets' values from batch"
-        assert self.target_key in targets, (
-            f"Missing '{self.target_key}' in targets {list(targets.keys())}"
-        )
-        targets = targets[self.target_key]
-        assert isinstance(targets, torch.Tensor), (
-            f"Expected torch.Tensor, found {type(targets)}"
-        )
-
-        # Select the baseline scan
-        inputs = scans[:, 0]
-
-        # Build z-slice attention mask from segmentation masks
-        if masks is not None:
-            # Select baseline mask
-            attn_mask = einops.rearrange(masks[:, 0], "b 1 1 x y z -> b x y z")
-            # Do not attend to z-slices that don't have lesion
-            attn_mask = einops.reduce(attn_mask > 0, "b x y z -> b z", "any")
-        else:
-            attn_mask = None
-
-        return inputs, targets, attn_mask
-
-
-# =============================================================================
-# Tests
-# =============================================================================
 
 
 def test_volume_to_rgb_slices():
@@ -426,15 +434,75 @@ def test_lightning_module():
     trainer.fit(model, train_dataloaders=loader, val_dataloaders=loader)
 
 
+def test_all_strategies():
+    from lesion_tracking.dataset.config import (
+        DatasetConfig,
+        LoaderConfig,
+        PreprocessingConfig,
+        make_loader,
+    )
+    from lesion_tracking.model.config import (
+        ClassificationModuleConfig,
+        PoolingConfig,
+        make_classification_module,
+    )
+    from lesion_tracking.training.config import TrainingConfig
+
+    task = "crs"
+    strategies = ["only_pre", "diff", "mean", "concat", "cross_attn"]
+
+    dataset_cfg = DatasetConfig(
+        dataset_path="inputs/neov",
+        enable_augmentations=False,
+        task=task,
+        drop_missing_targets=True,
+    )
+    preprocessing_cfg = PreprocessingConfig(
+        normalization="soft_tissue",
+        target_size=(38, 38, 24),
+        spacing=(5.0, 5.0, 20.0),
+    )
+    loader_cfg = LoaderConfig(cases_per_batch=2, num_workers=0)
+    training_cfg = TrainingConfig(max_epochs=2)
+
+    loader = make_loader(dataset_cfg, preprocessing_cfg, loader_cfg)
+    batch = next(iter(loader))
+
+    for strategy in strategies:
+        logger.info(f"Testing strategy: {strategy}")
+
+        model = make_classification_module(
+            ClassificationModuleConfig(
+                strategy=strategy,
+                pooling=PoolingConfig(return_attention=False),
+            ),
+            training_cfg,
+            task=task,
+        )
+        model.eval()
+
+        with torch.no_grad():
+            loss, probs, targets = model._shared_step(batch)
+
+        logger.info(
+            f"  loss: {loss.item():.4f}, probs: {probs.shape}, targets: {targets.shape}"
+        )
+
+    logger.info("All strategies passed.")
+
+
 # =============================================================================
 # Main
 # =============================================================================
 
 
 def main():
+    setup_logging()
+
     # test_volume_to_rgb_slices()
     # test_split_global_and_local_features()
-    test_lightning_module()
+    # test_lightning_module()
+    test_all_strategies()
 
 
 if __name__ == "__main__":

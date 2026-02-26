@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from lesion_tracking.training.config import TrainingConfig
 
 if TYPE_CHECKING:
-    from lesion_tracking.model.classifier import BaselineScanClassifier
+    from lesion_tracking.model.classifier import PairedTimepointClassifier
 
 
 @dataclass
@@ -29,6 +29,7 @@ class MLPStackConfig:
 class ClassificationModuleConfig:
     backbone: str = "dinov2-small"
     freeze_backbone: bool = True
+    strategy: str = "only_pre"
     pooling: PoolingConfig = field(default_factory=PoolingConfig)
     classifier: MLPStackConfig = field(default_factory=MLPStackConfig)
 
@@ -37,12 +38,13 @@ def make_classification_module(
     cfg: ClassificationModuleConfig,
     training_cfg: TrainingConfig,
     task: str,
-) -> BaselineScanClassifier:
+) -> PairedTimepointClassifier:
     from lesion_tracking.dataset.dataset import TASKS
-    from lesion_tracking.model.classifier import BaselineScanClassifier
+    from lesion_tracking.model.classifier import PairedTimepointClassifier
     from lesion_tracking.model.modules import (
-        AttentionBasedPooling,
+        CrossTimepointFeaturePooling,
         MLPStack,
+        SelfSlicePooling,
         SliceBasedVolumeEncoder,
     )
 
@@ -57,15 +59,18 @@ def make_classification_module(
     )
 
     encoder = SliceBasedVolumeEncoder(backbone=cfg.backbone, freeze=cfg.freeze_backbone)
-    pooling = AttentionBasedPooling(
+    pooling = SelfSlicePooling(
         hidden_size=encoder.hidden_size,
         dropout=cfg.pooling.dropout,
         return_attention=cfg.pooling.return_attention,
         use_rope=cfg.pooling.use_rope,
         rope_theta=cfg.pooling.rope_theta,
     )
+    classifier_input_dim = (
+        2 * encoder.hidden_size if cfg.strategy == "concat" else encoder.hidden_size
+    )
     classifier = MLPStack(
-        input_dim=encoder.hidden_size,
+        input_dim=classifier_input_dim,
         output_dim=task_def.num_classes,
         num_hidden_layers=cfg.classifier.num_hidden_layers,
         hidden_dim=cfg.classifier.hidden_dim,
@@ -73,13 +78,21 @@ def make_classification_module(
         activation=cfg.classifier.activation,
     )
 
-    return BaselineScanClassifier(
-        target_key=task_def.keys[0],
+    cross_attn = (
+        CrossTimepointFeaturePooling(hidden_size=encoder.hidden_size)
+        if cfg.strategy == "cross_attn"
+        else None
+    )
+
+    return PairedTimepointClassifier(
         num_classes=task_def.num_classes,
         encoder=encoder,
         pooling=pooling,
         classifier=classifier,
-        scheduler=training_cfg.scheduler,
+        strategy=cfg.strategy,
+        target_key=task_def.keys[0],
         lr=training_cfg.lr,
         weight_decay=training_cfg.weight_decay,
+        scheduler_cfg=training_cfg.scheduler,
+        cross_attn=cross_attn,
     )

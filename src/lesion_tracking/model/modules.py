@@ -109,7 +109,7 @@ class SliceBasedVolumeEncoder(nn.Module):
         return cls_token, patch_features
 
 
-class AttentionBasedPooling(nn.Module):
+class SelfSlicePooling(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -219,6 +219,138 @@ class AttentionBasedPooling(nn.Module):
             counts = mask.sum(dim=1).clamp(min=1)
             return x.sum(dim=1) / einops.rearrange(counts, "b -> b 1")
         return x.mean(dim=1)
+
+
+class CrossTimepointSlicePooling(nn.Module):
+    """Cross-attention between slice-level features from two timepoints.
+
+    Operates on (B, Z, H) sequences: post-treatment queries attend to
+    pre-treatment keys/values, then mean-pools to (B, H).
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert hidden_size % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.norm_pre = nn.LayerNorm(hidden_size)
+        self.norm_post = nn.LayerNorm(hidden_size)
+
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        pre_features: torch.Tensor,
+        post_features: torch.Tensor,
+        pre_mask: torch.Tensor | None = None,
+        post_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            pre_features:  (B, Z_pre, H) — pre-treatment slice embeddings (keys/values)
+            post_features: (B, Z_post, H) — post-treatment slice embeddings (queries)
+            pre_mask:  (B, Z_pre) bool, True = valid
+            post_mask: (B, Z_post) bool, True = valid
+
+        Returns: (B, H) — pooled cross-attended features
+        """
+        pre = self.norm_pre(pre_features)
+        post = self.norm_post(post_features)
+
+        Q = self.q_proj(post)
+        K = self.k_proj(pre)
+        V = self.v_proj(pre)
+
+        # Reshape for multi-head attention
+        Q = einops.rearrange(Q, "b s (h d) -> b h s d", h=self.num_heads)
+        K = einops.rearrange(K, "b s (h d) -> b h s d", h=self.num_heads)
+        V = einops.rearrange(V, "b s (h d) -> b h s d", h=self.num_heads)
+
+        # Build key mask: (B, Z_pre) -> (B, 1, 1, Z_pre)
+        attn_mask = None
+        if pre_mask is not None:
+            attn_mask = einops.rearrange(
+                torch.where(pre_mask, 0.0, float("-inf")),
+                "b k -> b 1 1 k",
+            )
+
+        out = F.scaled_dot_product_attention(
+            Q,
+            K,
+            V,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout.p if self.training else 0.0,
+        )
+        out = einops.rearrange(out, "b h s d -> b s (h d)")
+        out = self.out_proj(out)
+
+        # Masked mean pool over query (post) positions
+        if post_mask is not None:
+            out = out * einops.rearrange(post_mask, "b z -> b z 1")
+            counts = post_mask.sum(dim=1).clamp(min=1)
+            return out.sum(dim=1) / einops.rearrange(counts, "b -> b 1")
+        return out.mean(dim=1)
+
+
+class CrossTimepointFeaturePooling(nn.Module):
+    """Cross-attention between two pooled feature vectors.
+
+    Takes pre and post (B, H) vectors, stacks them into a length-2 KV
+    sequence, and lets the post query attend over both. Outputs (B, H).
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert hidden_size % num_heads == 0
+        self.num_heads = num_heads
+
+        self.norm_pre = nn.LayerNorm(hidden_size)
+        self.norm_post = nn.LayerNorm(hidden_size)
+
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        pre_features: torch.Tensor,
+        post_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            pre_features:  (B, H)
+            post_features: (B, H)
+        Returns: (B, H)
+        """
+        pre = self.norm_pre(pre_features)
+        post = self.norm_post(post_features)
+
+        # Query from post, keys/values from both — so the query
+        # attends over a length-2 sequence and learns to mix them
+        query = einops.rearrange(post, "b h -> b 1 h")
+        kv, _ = einops.pack([pre, post], "b * h")  # (B, 2, H)
+
+        Q = einops.rearrange(
+            self.q_proj(query), "b s (h d) -> b h s d", h=self.num_heads
+        )
+        K = einops.rearrange(self.k_proj(kv), "b s (h d) -> b h s d", h=self.num_heads)
+        V = einops.rearrange(self.v_proj(kv), "b s (h d) -> b h s d", h=self.num_heads)
+
+        out = F.scaled_dot_product_attention(
+            Q,
+            K,
+            V,
+            dropout_p=self.dropout.p if self.training else 0.0,
+        )
+        out = einops.rearrange(out, "b h 1 d -> b (h d)")
+        return self.out_proj(out)
 
 
 class MLPStack(nn.Sequential):
