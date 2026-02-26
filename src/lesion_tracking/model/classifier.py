@@ -4,6 +4,7 @@ import einops
 import lightning as L
 import torch
 import torch.nn as nn
+from lightning.pytorch.loggers import WandbLogger
 
 from lesion_tracking.logger import get_logger, setup_logging
 from lesion_tracking.training.config import (
@@ -64,6 +65,10 @@ class PairedTimepointClassifier(L.LightningModule):
         )
         self.train_metrics = make_metrics(num_classes, prefix="train/")
         self.val_metrics = make_metrics(num_classes, prefix="val/")
+        self._train_preds: list[torch.Tensor] = []
+        self._train_targets: list[torch.Tensor] = []
+        self._val_preds: list[torch.Tensor] = []
+        self._val_targets: list[torch.Tensor] = []
 
     def prepare_batch(
         self, batch
@@ -162,6 +167,11 @@ class PairedTimepointClassifier(L.LightningModule):
         loss, probs, targets = self._shared_step(batch)
         bs = targets.shape[0]
         self.train_metrics.update(probs, targets)
+        if self.num_classes <= 2:
+            self._train_preds.append((probs > 0.5).long().detach().cpu())
+        else:
+            self._train_preds.append(probs.argmax(dim=-1).detach().cpu())
+        self._train_targets.append(targets.long().detach().cpu())
         self.log(
             "train/loss",
             loss,
@@ -175,11 +185,44 @@ class PairedTimepointClassifier(L.LightningModule):
     def on_train_epoch_end(self):
         self.log_dict(self.train_metrics.compute(), prog_bar=True)
         self.train_metrics.reset()
+        self._log_confusion_matrix(self._train_preds, self._train_targets, "train")
+        self._train_preds.clear()
+        self._train_targets.clear()
+
+    def _log_confusion_matrix(
+        self,
+        preds: list[torch.Tensor],
+        targets: list[torch.Tensor],
+        split: str,
+    ):
+        assert isinstance(self.logger, WandbLogger)
+
+        if self.logger is None or not hasattr(self.logger.experiment, "log"):
+            return
+        import wandb
+
+        y_true = torch.cat(targets).numpy().tolist()
+        y_pred = torch.cat(preds).numpy().tolist()
+        class_names = [str(i) for i in range(self.num_classes)]
+        self.logger.experiment.log(
+            {
+                f"{split}/confusion_matrix": wandb.plot.confusion_matrix(
+                    y_true=y_true,
+                    preds=y_pred,
+                    class_names=class_names,
+                )
+            },
+        )
 
     def validation_step(self, batch, batch_idx):
         loss, probs, targets = self._shared_step(batch)
         bs = targets.shape[0]
         self.val_metrics.update(probs, targets)
+        if self.num_classes <= 2:
+            self._val_preds.append((probs > 0.5).long().detach().cpu())
+        else:
+            self._val_preds.append(probs.argmax(dim=-1).detach().cpu())
+        self._val_targets.append(targets.long().detach().cpu())
         self.log(
             "val/loss",
             loss,
@@ -193,6 +236,9 @@ class PairedTimepointClassifier(L.LightningModule):
     def on_validation_epoch_end(self):
         self.log_dict(self.val_metrics.compute(), prog_bar=True)
         self.val_metrics.reset()
+        self._log_confusion_matrix(self._val_preds, self._val_targets, "val")
+        self._val_preds.clear()
+        self._val_targets.clear()
 
     def configure_optimizers(self):  # type: ignore
         optimizer = torch.optim.AdamW(

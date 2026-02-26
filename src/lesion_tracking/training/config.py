@@ -8,8 +8,20 @@ from torchmetrics import MetricCollection
 from torchmetrics.classification import (
     BinaryAccuracy,
     BinaryAUROC,
+    BinaryAveragePrecision,
+    BinaryCalibrationError,
+    BinaryF1Score,
+    BinaryPrecision,
+    BinaryRecall,
+    BinarySpecificity,
     MulticlassAccuracy,
     MulticlassAUROC,
+    MulticlassAveragePrecision,
+    MulticlassCalibrationError,
+    MulticlassF1Score,
+    MulticlassPrecision,
+    MulticlassRecall,
+    MulticlassSpecificity,
 )
 
 
@@ -104,12 +116,36 @@ def make_callbacks(training_cfg) -> list[L.Callback]:
 
 def make_metrics(num_classes: int, prefix: str = "") -> MetricCollection:
     if num_classes <= 2:
-        metrics = MetricCollection({"auroc": BinaryAUROC(), "acc": BinaryAccuracy()})
+        metrics = MetricCollection(
+            {
+                "auroc": BinaryAUROC(),
+                "ap": BinaryAveragePrecision(),
+                "acc": BinaryAccuracy(),
+                "precision": BinaryPrecision(),
+                "recall": BinaryRecall(),
+                "specificity": BinarySpecificity(),
+                "f1": BinaryF1Score(),
+                "cal_error": BinaryCalibrationError(),
+            }
+        )
     else:
         metrics = MetricCollection(
             {
                 "auroc": MulticlassAUROC(num_classes=num_classes),
+                "ap": MulticlassAveragePrecision(num_classes=num_classes),
                 "acc": MulticlassAccuracy(num_classes=num_classes),
+                "balanced_acc": MulticlassAccuracy(
+                    num_classes=num_classes, average="macro"
+                ),
+                "precision": MulticlassPrecision(
+                    num_classes=num_classes, average="macro"
+                ),
+                "recall": MulticlassRecall(num_classes=num_classes, average="macro"),
+                "specificity": MulticlassSpecificity(
+                    num_classes=num_classes, average="macro"
+                ),
+                "f1": MulticlassF1Score(num_classes=num_classes, average="macro"),
+                "cal_error": MulticlassCalibrationError(num_classes=num_classes),
             }
         )
     return metrics.clone(prefix=prefix)
