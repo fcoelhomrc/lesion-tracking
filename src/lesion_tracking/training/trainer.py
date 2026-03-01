@@ -58,6 +58,7 @@ def train(cfg: Config) -> None:
         callbacks=callbacks,
         enable_checkpointing=cfg.training.enable_checkpointing,
         logger=wandb_logger,
+        log_every_n_steps=1,
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
