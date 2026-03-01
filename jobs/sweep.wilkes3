@@ -1,0 +1,88 @@
+#!/bin/bash
+#!
+#! Architecture sweep — lesion-tracking on Wilkes3 (A100)
+#! Claims 2 GPUs and runs experiments in parallel pairs (6 total = 3 pairs).
+#!
+#! Usage: sbatch jobs/sweep.wilkes3 /path/to/dataset [wandb_dir]
+#!   wandb_dir defaults to /rds/user/$USER/hpc-work/wandb
+#!
+
+#!#############################################################
+#!#### Modify the options in this section as appropriate ######
+#!#############################################################
+
+#! sbatch directives begin here ###############################
+#SBATCH -J lesion-tracking-sweep
+#SBATCH -A CRISPIN-ORTUZAR-SL2-GPU
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:2
+#! 3 pairs sequentially — budget ~2x a single run:
+#SBATCH --time=24:00:00
+#SBATCH --mail-type=FAIL,END
+
+#! Do not change:
+#SBATCH -p ampere
+
+#! sbatch directives end here (put any additional directives above this line)
+
+. /etc/profile.d/modules.sh
+module purge
+module load rhel8/default-amp
+
+#!#############################################################
+#!#### Edit these two lines                               ######
+#!#############################################################
+
+DATASET_PATH="${1:?Error: dataset path required as first argument}"
+WANDB_DIR="${2:-/rds/user/$USER/hpc-work/wandb}"
+
+#!#############################################################
+
+workdir="$SLURM_SUBMIT_DIR"
+cd "$workdir"
+
+export OMP_NUM_THREADS=1
+export WANDB_DIR="$WANDB_DIR"
+mkdir -p "$WANDB_DIR"
+
+echo "======================================================"
+echo "JobID:    $SLURM_JOB_ID"
+echo "Dataset:  $DATASET_PATH"
+echo "WANDB:    $WANDB_DIR"
+echo "Node:     $(hostname)"
+echo "Time:     $(date)"
+echo "======================================================"
+
+set -e
+
+echo -e "\nSyncing venv..."
+uv sync
+
+run_experiment() {
+    local experiment="$1"
+    local gpu="$2"
+    echo "[GPU $gpu] Starting: $experiment  ($(date))"
+    CUDA_VISIBLE_DEVICES="$gpu" uv run --no-sync lesion-tracking-train \
+        +experiment="$experiment" \
+        dataset.dataset_path="$DATASET_PATH" \
+        &> "$WANDB_DIR/${experiment}.log"
+    echo "[GPU $gpu] Done:     $experiment  ($(date))"
+}
+
+# Pair 1
+run_experiment single_tp      0 &
+run_experiment single_tp_rope 1 &
+wait
+
+# Pair 2
+run_experiment two_tp_diff  0 &
+run_experiment two_tp_mean  1 &
+wait
+
+# Pair 3
+run_experiment two_tp_concat     0 &
+run_experiment two_tp_cross_attn 1 &
+wait
+
+echo -e "\nAll experiments done.  ($(date))"

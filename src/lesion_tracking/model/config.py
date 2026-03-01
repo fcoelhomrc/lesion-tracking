@@ -32,6 +32,9 @@ class ClassificationModuleConfig:
     strategy: str = "only_pre"
     pooling: PoolingConfig = field(default_factory=PoolingConfig)
     classifier: MLPStackConfig = field(default_factory=MLPStackConfig)
+    # When set, the segmentation mask is filtered to this label before building
+    # the slice attention mask (e.g. 1 = Omentum). None means any non-zero label.
+    mask_label: int | None = None
 
 
 def make_classification_module(
@@ -95,4 +98,5 @@ def make_classification_module(
         weight_decay=training_cfg.weight_decay,
         scheduler_cfg=training_cfg.scheduler,
         cross_attn=cross_attn,
+        mask_label=cfg.mask_label,
     )

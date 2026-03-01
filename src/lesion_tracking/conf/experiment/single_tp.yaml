@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - arch_sweep_base
+
+model:
+  strategy: only_pre
+
+training:
+  tags: ["arch_sweep", "single_tp"]

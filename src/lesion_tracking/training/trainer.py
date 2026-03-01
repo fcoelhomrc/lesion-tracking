@@ -65,7 +65,11 @@ def train(cfg: Config) -> None:
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(raw_cfg: DictConfig) -> None:
+    import wandb
+
     setup_logging()
+    wandb.init(settings=wandb.Settings(init_timeout=600))
+
     cfg: Config = OmegaConf.to_object(raw_cfg)  # type: ignore
     train(cfg)
 

@@ -664,9 +664,9 @@ class LongitudinalDataset(Dataset):
                 # Spatial transforms (scan + mask)
                 Rand3DElasticd(
                     keys=spatial_keys,
-                    sigma_range=(0.05, 0.05),
-                    magnitude_range=(0.05, 0.05),
-                    prob=1.0,
+                    sigma_range=(5, 7),
+                    magnitude_range=(50, 150),
+                    prob=0.3,
                     mode=("bilinear", "nearest"),
                 ),
                 RandRotated(
@@ -694,7 +694,7 @@ class LongitudinalDataset(Dataset):
                 RandGaussianNoised(
                     keys=["scan"],
                     std=0.05,
-                    prob=1.0,
+                    prob=0.5,
                 ),
                 RandGaussianSmoothd(
                     keys=["scan"],
@@ -759,7 +759,7 @@ class LongitudinalDataset(Dataset):
                 ]
             )
         elif self._normalization == "soft_tissue":
-            # Soft tissue window: center=50 HU, width=500 HU -> [-150, 250] HU
+            # Soft tissue window: [-150, 250] HU
             full_pipeline.extend(
                 [
                     ScaleIntensityRanged(
@@ -772,6 +772,22 @@ class LongitudinalDataset(Dataset):
                     ),
                 ]
             )
+
+        elif self._normalization == "bone":
+            # Bone window: [-200, 1500] HU
+            full_pipeline.extend(
+                [
+                    ScaleIntensityRanged(
+                        keys=["scan"],
+                        a_min=-200.0,
+                        a_max=1500.0,
+                        b_min=0.0,
+                        b_max=1.0,
+                        clip=True,
+                    ),
+                ]
+            )
+
         elif self._normalization == "hu_units":
             # Do not apply any normalizations
             pass

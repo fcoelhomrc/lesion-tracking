@@ -33,6 +33,7 @@ class PairedTimepointClassifier(L.LightningModule):
         weight_decay: float,
         scheduler_cfg: SchedulerConfig,
         cross_attn: nn.Module | None = None,
+        mask_label: int | None = None,
     ):
         super().__init__()
         self.save_hyperparameters(
@@ -55,6 +56,7 @@ class PairedTimepointClassifier(L.LightningModule):
         self.cross_attn = cross_attn
         self.strategy = strategy
         self.target_key = target_key
+        self.mask_label = mask_label
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -89,7 +91,12 @@ class PairedTimepointClassifier(L.LightningModule):
         # Build z-slice attention mask from segmentation masks
         if masks is not None:
             attn_mask = einops.rearrange(masks, "b l 1 1 x y z -> b l x y z")
-            attn_mask = einops.reduce(attn_mask > 0, "b l x y z -> b l z", "any")
+            mask_cond = (
+                attn_mask == self.mask_label
+                if self.mask_label is not None
+                else attn_mask > 0
+            )
+            attn_mask = einops.reduce(mask_cond, "b l x y z -> b l z", "any")
         else:
             attn_mask = None
 

@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - arch_sweep_base
+
+model:
+  strategy: mean
+
+training:
+  tags: ["arch_sweep", "two_tp", "mean"]

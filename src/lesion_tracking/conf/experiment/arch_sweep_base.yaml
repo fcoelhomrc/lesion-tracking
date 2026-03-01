@@ -1,0 +1,35 @@
+# @package _global_
+# Shared base for architecture-sweep experiments.
+# Fixes everything except model strategy / pooling so only the architecture
+# mode is varied across runs.
+
+dataset:
+  task: crs
+  enable_augmentations: false
+
+preprocessing:
+  target_size: [512, 512, 96]
+  normalization: zscore
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  max_epochs: 100
+  # Effectively disable early stopping — let the full cosine decay run.
+  early_stopping_patience: 9999
+  scheduler:
+    name: cosine
+    warmup_steps: 5
+
+model:
+  backbone: dinov2-small
+  freeze_backbone: true
+  # Filter attention mask to label 1 (Omentum) only.
+  mask_label: 1
+  pooling:
+    dropout: 0.1
+    use_rope: false
+  classifier:
+    num_hidden_layers: 1
+    hidden_dim: 256
+    dropout_rate: 0.1
