@@ -54,7 +54,7 @@ echo "Node:     $(hostname)"
 echo "Time:     $(date)"
 echo "======================================================"
 
-set -e
+set -eo pipefail
 
 echo -e "\nSyncing venv..."
 uv sync
@@ -62,27 +62,29 @@ uv sync
 run_experiment() {
     local experiment="$1"
     local gpu="$2"
+    local logfile="$WANDB_DIR/${experiment}.log"
     echo "[GPU $gpu] Starting: $experiment  ($(date))"
+    # tee: output goes to SLURM stdout (visible in squeue/sacct logs) AND per-run log file
     CUDA_VISIBLE_DEVICES="$gpu" uv run --no-sync lesion-tracking-train \
         +experiment="$experiment" \
         dataset.dataset_path="$DATASET_PATH" \
-        &> "$WANDB_DIR/${experiment}.log"
-    echo "[GPU $gpu] Done:     $experiment  ($(date))"
+        2>&1 | tee "$logfile"
+    echo "[GPU $gpu] Done: $experiment  ($(date))"
 }
 
-# Pair 1
-run_experiment single_tp      0 &
-run_experiment single_tp_rope 1 &
-wait
+run_pair() {
+    local exp1="$1" exp2="$2"
+    run_experiment "$exp1" 0 & local pid1=$!
+    run_experiment "$exp2" 1 & local pid2=$!
 
-# Pair 2
-run_experiment two_tp_diff  0 &
-run_experiment two_tp_mean  1 &
-wait
+    local failed=0
+    wait "$pid1" || { echo "FAILED: $exp1 (see $WANDB_DIR/${exp1}.log)"; failed=1; }
+    wait "$pid2" || { echo "FAILED: $exp2 (see $WANDB_DIR/${exp2}.log)"; failed=1; }
+    [[ "$failed" -eq 0 ]] || exit 1
+}
 
-# Pair 3
-run_experiment two_tp_concat     0 &
-run_experiment two_tp_cross_attn 1 &
-wait
+run_pair single_tp      single_tp_rope
+run_pair two_tp_diff    two_tp_mean
+run_pair two_tp_concat  two_tp_cross_attn
 
 echo -e "\nAll experiments done.  ($(date))"
