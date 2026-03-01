@@ -65,7 +65,7 @@ run_experiment() {
     local logfile="$WANDB_DIR/${experiment}.log"
     echo "[GPU $gpu] Starting: $experiment  ($(date))"
     # tee: output goes to SLURM stdout (visible in squeue/sacct logs) AND per-run log file
-    CUDA_VISIBLE_DEVICES="$gpu" uv run --no-sync lesion-tracking-train \
+    CUDA_VISIBLE_DEVICES="$gpu" uv run lesion-tracking-train \
         +experiment="$experiment" \
         dataset.dataset_path="$DATASET_PATH" \
         2>&1 | tee "$logfile"
