@@ -57,6 +57,7 @@ echo "======================================================"
 set -eo pipefail
 
 echo -e "\nSyncing venv..."
+rm -rf .venv
 uv sync
 
 run_experiment() {
