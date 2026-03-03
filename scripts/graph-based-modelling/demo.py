@@ -280,16 +280,39 @@ def generate_scenario(rng):
 # ─── OT ──────────────────────────────────────────────────────
 
 
-def run_ot(rhos, reg_m=None):
+def _spawn_mask(rho_src, rho_dst):
+    """Boolean mask of rho_dst pixels belonging to components with no overlap with rho_src."""
+    lbl, n = nd_label(rho_dst > 0)
+    src_support = rho_src > 0
+    mask = np.zeros_like(rho_dst, dtype=bool)
+    for i in range(1, n + 1):
+        comp = lbl == i
+        if not np.any(comp & src_support):
+            mask |= comp
+    return mask
+
+
+def run_ot(rhos, reg_m=None, exclude_spawn=False):
     """Compute unbalanced OT for consecutive timepoints.
 
     reg_m: marginal-relaxation penalty. Lower = more eager to destroy/create mass.
            If None, an adaptive value is derived from the mass ratio per transition.
+    exclude_spawn: if True, pixels in rho_{t+1} with no spatial overlap with rho_t
+                   are excluded from OT (treated as spawn candidates).
     """
     all_coords = [np.array(np.nonzero(r)).T.astype(float) for r in rhos]
     Ps = []
+    ot_dst_coords = []
     for i in range(len(rhos) - 1):
-        c0, c1 = all_coords[i], all_coords[i + 1]
+        c0 = all_coords[i]
+        if exclude_spawn:
+            mask = _spawn_mask(rhos[i], rhos[i + 1])
+            full = all_coords[i + 1].astype(int)
+            keep = ~mask[full[:, 0], full[:, 1]]
+            c1 = all_coords[i + 1][keep]
+        else:
+            c1 = all_coords[i + 1]
+        ot_dst_coords.append(c1)
         if len(c0) == 0 or len(c1) == 0:
             Ps.append(np.zeros((max(1, len(c0)), max(1, len(c1)))))
             continue
@@ -306,13 +329,13 @@ def run_ot(rhos, reg_m=None):
             a, b, C, reg=0.05, reg_m=effective_reg_m
         )
         Ps.append(P)
-    return Ps, all_coords
+    return Ps, all_coords, ot_dst_coords
 
 
 # ─── Temporal graph ───────────────────────────────────────────
 
 
-def build_temporal_graph(rhos, Ps, all_coords):
+def build_temporal_graph(rhos, Ps, all_coords, ot_dst_coords=None):
     nodes, edges, labeled = {}, [], []
     for t, rho in enumerate(rhos):
         lbl, n = nd_label(rho > 0)
@@ -324,7 +347,7 @@ def build_temporal_graph(rhos, Ps, all_coords):
     for ti, P in enumerate(Ps):
         ls, ld = labeled[ti], labeled[ti + 1]
         sc = all_coords[ti].astype(int)
-        dc = all_coords[ti + 1].astype(int)
+        dc = (ot_dst_coords[ti] if ot_dst_coords is not None else all_coords[ti + 1]).astype(int)
         if len(sc) == 0 or len(dc) == 0:
             continue
         sl = ls[sc[:, 0], sc[:, 1]]
@@ -733,6 +756,142 @@ def _draw_row(ax, rhos, nodes, edges):
     ax.axis("off")
 
 
+# ─── Sweep ────────────────────────────────────────────────────
+
+_SWEEP_REG_M = [0.05, 0.10, None]
+_SWEEP_PRUNE = [(False, None), (True, 0.50), (True, 0.10), (True, 0.05)]
+_SWEEP_EXCLUDE_SPAWN = [False, True]
+
+
+def _run_one_scenario(rng, reg_m, prune, prune_threshold, exclude_spawn):
+    grids, all_specs, _ = generate_scenario(rng)
+    Ps, coords, ot_dst = run_ot(grids, reg_m=reg_m, exclude_spawn=exclude_spawn)
+    nodes, edges, labeled = build_temporal_graph(grids, Ps, coords, ot_dst)
+    if prune:
+        edges = prune_graph_edges(edges, threshold=prune_threshold)
+    gt_per_t = build_gt_edges(all_specs)
+    return evaluate(gt_per_t, edges, all_specs, labeled)
+
+
+def _cfg_label(reg_m, prune, pt, excl):
+    return (
+        "auto" if reg_m is None else f"{reg_m:.2f}",
+        "off" if not prune else f"{pt:.2f}",
+        "on" if excl else "off",
+    )
+
+
+def _print_sweep_summary(results, n_seeds):
+    _etypes = ("continue", "split", "merge", "spawn", "kill")
+    t = Table(
+        title=f"Sweep Summary  (median over {n_seeds} seeds)",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold dim",
+        title_style="bold",
+    )
+    for col in ("reg_m", "prune", "excl_spawn", "F1", "Prec", "Rec"):
+        t.add_column(col, justify="right")
+    for et in _etypes:
+        t.add_column(et[:4], justify="right")
+    for (reg_m, prune, pt, excl), l1, l2, _ in results:
+        reg_s, prune_s, spawn_s = _cfg_label(reg_m, prune, pt, excl)
+        t.add_row(
+            reg_s,
+            prune_s,
+            spawn_s,
+            _cf(l1["f1"]),
+            _cf(l1["precision"]),
+            _cf(l1["recall"]),
+            *[_cf(l2[et]["recovery"]) for et in _etypes],
+        )
+    _console.print(t)
+
+
+def _print_sweep_cms(results):
+    for (reg_m, prune, pt, excl), _, _, cm in results:
+        reg_s, prune_s, spawn_s = _cfg_label(reg_m, prune, pt, excl)
+        _console.rule(f"[dim]reg={reg_s}  prune={prune_s}  excl_spawn={spawn_s}[/dim]")
+        print_confusion_matrix(cm)
+
+
+def run_sweep(n_rows=20, n_seeds=5):
+    _etypes = ("continue", "split", "merge", "spawn", "kill")
+    _pred_classes = (*_etypes, "missed")
+    configs = [
+        (reg_m, prune, pt, excl)
+        for excl in _SWEEP_EXCLUDE_SPAWN
+        for reg_m in _SWEEP_REG_M
+        for prune, pt in _SWEEP_PRUNE
+    ]
+    results = []
+    with Progress(
+        SpinnerColumn(),
+        "[progress.description]{task.description}",
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeElapsedColumn(),
+        console=_console,
+    ) as progress:
+        sweep_task = progress.add_task("Sweeping…", total=len(configs) * n_seeds)
+        for ci, (reg_m, prune, pt, excl) in enumerate(configs):
+            seed_l1s, seed_l2s, seed_cms = [], [], []
+            for seed in range(n_seeds):
+                reg_s, prune_s, spawn_s = _cfg_label(reg_m, prune, pt, excl)
+                progress.update(
+                    sweep_task,
+                    description=(
+                        f"cfg {ci + 1}/{len(configs)}  seed {seed + 1}/{n_seeds}  "
+                        f"reg={reg_s} prune={prune_s} excl={spawn_s}"
+                    ),
+                )
+                rng = np.random.default_rng(seed)
+                run_l1s, run_l2s, run_cms = [], [], []
+                for _ in range(n_rows):
+                    l1, l2, cm = _run_one_scenario(rng, reg_m, prune, pt, excl)
+                    run_l1s.append(l1)
+                    run_l2s.append(l2)
+                    run_cms.append(cm)
+                # aggregate n_rows scenarios (match main's aggregation)
+                agg_l1 = {
+                    k: float(np.mean([x[k] for x in run_l1s]))
+                    for k in ("precision", "recall", "f1", "tp", "fp", "fn")
+                }
+                agg_l2 = {
+                    et: {
+                        "recovery": float(np.mean([x[et]["recovery"] for x in run_l2s])),
+                        "tp": sum(x[et]["tp"] for x in run_l2s),
+                        "fn": sum(x[et]["fn"] for x in run_l2s),
+                    }
+                    for et in _etypes
+                }
+                agg_cm = {
+                    gt: {pr: sum(c[gt][pr] for c in run_cms) for pr in _pred_classes}
+                    for gt in _etypes
+                }
+                seed_l1s.append(agg_l1)
+                seed_l2s.append(agg_l2)
+                seed_cms.append(agg_cm)
+                progress.advance(sweep_task)
+
+            med_l1 = {k: float(np.median([x[k] for x in seed_l1s])) for k in seed_l1s[0]}
+            med_l2 = {
+                et: {
+                    k: float(np.median([x[et][k] for x in seed_l2s]))
+                    for k in ("recovery", "tp", "fn")
+                }
+                for et in _etypes
+            }
+            med_cm = {
+                gt: {pr: int(np.median([x[gt][pr] for x in seed_cms])) for pr in _pred_classes}
+                for gt in _etypes
+            }
+            results.append(((reg_m, prune, pt, excl), med_l1, med_l2, med_cm))
+
+    _console.rule("[bold]Sweep Report[/bold]")
+    _print_sweep_summary(results, n_seeds)
+    _print_sweep_cms(results)
+
+
 # ─── Entry point ──────────────────────────────────────────────
 
 
@@ -744,6 +903,7 @@ def main(
     prune_threshold=0.5,
     do_eval=False,
     verbose=False,
+    exclude_spawn=False,
 ):
     rng = np.random.default_rng(seed)
 
@@ -770,8 +930,8 @@ def main(
         for idx, ax in enumerate(axes):
             progress.update(task, description=f"Scenario {idx + 1}/{n_rows}")
             grids, all_specs, phenomena = generate_scenario(rng)
-            Ps, coords = run_ot(grids, reg_m=reg_m)
-            nodes, edges, labeled = build_temporal_graph(grids, Ps, coords)
+            Ps, coords, ot_dst = run_ot(grids, reg_m=reg_m, exclude_spawn=exclude_spawn)
+            nodes, edges, labeled = build_temporal_graph(grids, Ps, coords, ot_dst)
             if prune:
                 edges = prune_graph_edges(edges, threshold=prune_threshold)
 
@@ -854,13 +1014,33 @@ if __name__ == "__main__":
         action="store_true",
         help="With --eval: also print per-scenario breakdown (default: aggregate only).",
     )
-    args = parser.parse_args()
-    main(
-        n_rows=args.rows,
-        seed=args.seed,
-        reg_m=args.reg_m,
-        prune=args.prune,
-        prune_threshold=args.prune_threshold,
-        do_eval=args.eval,
-        verbose=args.verbose,
+    parser.add_argument(
+        "--exclude-spawn",
+        action="store_true",
+        help="Exclude components with no spatial overlap with the previous frame from OT.",
     )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Run parameter sweep (reg_m × prune × exclude_spawn) and print report.",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=5,
+        help="Number of seeds per config for median computation in sweep mode (default: 5).",
+    )
+    args = parser.parse_args()
+    if args.sweep:
+        run_sweep(n_rows=args.rows, n_seeds=args.seeds)
+    else:
+        main(
+            n_rows=args.rows,
+            seed=args.seed,
+            reg_m=args.reg_m,
+            prune=args.prune,
+            prune_threshold=args.prune_threshold,
+            do_eval=args.eval,
+            verbose=args.verbose,
+            exclude_spawn=args.exclude_spawn,
+        )
