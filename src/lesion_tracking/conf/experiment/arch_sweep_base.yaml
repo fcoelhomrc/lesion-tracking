@@ -5,7 +5,7 @@
 
 dataset:
   task: crs
-  enable_augmentations: false
+  enable_augmentations: true
 
 preprocessing:
   target_size: [512, 512, 96]
