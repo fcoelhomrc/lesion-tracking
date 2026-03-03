@@ -665,7 +665,7 @@ class LongitudinalDataset(Dataset):
                 Rand3DElasticd(
                     keys=spatial_keys,
                     sigma_range=(5, 7),
-                    magnitude_range=(50, 150),
+                    magnitude_range=(1, 10),
                     prob=0.3,
                     mode=("bilinear", "nearest"),
                 ),
@@ -693,19 +693,19 @@ class LongitudinalDataset(Dataset):
                 # Intensity transforms (scan only)
                 RandGaussianNoised(
                     keys=["scan"],
-                    std=0.05,
+                    std=15,
                     prob=0.5,
                 ),
                 RandGaussianSmoothd(
                     keys=["scan"],
-                    sigma_x=(0.1, 0.2),
-                    sigma_y=(0.1, 0.2),
-                    sigma_z=(0.1, 0.2),
-                    prob=0.1,
+                    sigma_x=(0.5, 1.5),
+                    sigma_y=(0.5, 1.5),
+                    sigma_z=(0.5, 1.5),
+                    prob=0.3,
                 ),
                 RandScaleIntensityd(
                     keys=["scan"],
-                    factors=(-0.25, 0.25),
+                    factors=(-0.10, 0.10),
                     prob=0.15,
                 ),
                 RandAdjustContrastd(
