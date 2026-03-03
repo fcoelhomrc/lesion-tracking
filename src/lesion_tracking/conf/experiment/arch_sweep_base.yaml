@@ -11,6 +11,9 @@ preprocessing:
   target_size: [512, 512, 96]
   normalization: zscore
 
+loader:
+  fold: 0
+
 training:
   lr: 1.0e-3
   weight_decay: 1.0e-4
