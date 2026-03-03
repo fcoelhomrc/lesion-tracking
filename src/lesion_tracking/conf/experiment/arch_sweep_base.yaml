@@ -17,7 +17,7 @@ loader:
 training:
   lr: 1.0e-3
   weight_decay: 1.0e-4
-  max_epochs: 100
+  max_epochs: 50
   # Effectively disable early stopping — let the full cosine decay run.
   early_stopping_patience: 9999
   scheduler:
@@ -30,9 +30,9 @@ model:
   # Filter attention mask to label 1 (Omentum) only.
   mask_label: 1
   pooling:
-    dropout: 0.1
+    dropout: 0.50
     use_rope: false
   classifier:
     num_hidden_layers: 1
     hidden_dim: 256
-    dropout_rate: 0.1
+    dropout_rate: 0.50
