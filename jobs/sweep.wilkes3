@@ -39,6 +39,10 @@ WANDB_DIR="${2:-/rds/user/$USER/hpc-work/wandb}"
 
 #!#############################################################
 
+[[ -f "$HOME/.secrets" ]] && source "$HOME/.secrets"
+: "${WANDB_API_KEY:?Error: WANDB_API_KEY not set. Add it to ~/.secrets}"
+export WANDB_API_KEY
+
 workdir="$SLURM_SUBMIT_DIR"
 cd "$workdir"
 
