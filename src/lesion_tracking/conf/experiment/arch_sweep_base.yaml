@@ -9,7 +9,7 @@ dataset:
 
 preprocessing:
   target_size: [512, 512, 96]
-  normalization: zscore
+  normalization: soft_tissue
 
 loader:
   fold: 0
