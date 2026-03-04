@@ -32,6 +32,8 @@ dependencies = [
 
 [project.optional-dependencies]
 lesion-locator = ["lesionlocator @ git+https://github.com/MIC-DKFZ/LesionLocator"]
+graph-based-modelling = ["POT", "plotly", "scikit-image", "rich"]
+
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
