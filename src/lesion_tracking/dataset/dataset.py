@@ -100,6 +100,17 @@ def _ensure_uniform_tensor_shape(x: list | torch.Tensor) -> torch.Tensor:
     return torch.stack(x) if isinstance(x, list) else x.unsqueeze(0)
 
 
+# For hu_units, shift scan so that air (-1000 HU) maps to 0 before spatial augmentation,
+# then shift back. This ensures zeros padding == air during warping.
+# For all other normalizations, 0.0 already corresponds to air/background.
+def _shift_zero_to_air_hu_units(x):
+    return x + 1000.0
+
+
+def _undo_shift_zero_to_air_hu_units(x):
+    return x - 1000.0
+
+
 CASE_PATTERN = re.compile(r"^case_\d{4}$")  # case_XXXX
 
 # NOTE: How is 3D data usually processed by models?
@@ -659,8 +670,29 @@ class LongitudinalDataset(Dataset):
 
     def _build_augmentations(self):
         spatial_keys = ["scan", "mask"]
+
+        pre_aug = (
+            [Lambdad(keys=["scan"], func=_shift_zero_to_air_hu_units)]
+            if self._normalization == "hu_units"
+            else []
+        )
+        post_aug = (
+            [Lambdad(keys=["scan"], func=_undo_shift_zero_to_air_hu_units)]
+            if self._normalization == "hu_units"
+            else []
+        )
+
+        # Scale noise std to match the normalized intensity range.
+        noise_std = {
+            "hu_units": 15.0,
+            "soft_tissue": 15.0 / 400.0,  # [-150, 250] -> [0, 1], range=400
+            "bone": 15.0 / 1700.0,  # [-200, 1500] -> [0, 1], range=1700
+            "zscore": 0.1,  # heuristic: ~10% of unit std
+        }[self._normalization]
+
         self._augmentation_pipeline = Compose(
             [
+                *pre_aug,
                 # Spatial transforms (scan + mask)
                 Rand3DElasticd(
                     keys=spatial_keys,
@@ -668,6 +700,7 @@ class LongitudinalDataset(Dataset):
                     magnitude_range=(1, 10),
                     prob=0.3,
                     mode=("bilinear", "nearest"),
+                    padding_mode="zeros",
                 ),
                 RandRotated(
                     keys=spatial_keys,
@@ -676,6 +709,7 @@ class LongitudinalDataset(Dataset):
                     range_z=np.deg2rad(5),
                     prob=1.0,
                     mode=("bilinear", "nearest"),
+                    padding_mode="zeros",
                 ),
                 RandZoomd(
                     keys=spatial_keys,
@@ -683,17 +717,19 @@ class LongitudinalDataset(Dataset):
                     max_zoom=1.05,
                     prob=0.5,
                     mode=("bilinear", "nearest"),
+                    padding_mode="constant",
                 ),
                 RandAffined(
                     keys=spatial_keys,
                     translate_range=(5, 5, 5),
                     prob=1.0,
                     mode=("bilinear", "nearest"),
+                    padding_mode="zeros",
                 ),
                 # Intensity transforms (scan only)
                 RandGaussianNoised(
                     keys=["scan"],
-                    std=15,
+                    std=noise_std,
                     prob=0.5,
                 ),
                 RandGaussianSmoothd(
@@ -714,6 +750,7 @@ class LongitudinalDataset(Dataset):
                     retain_stats=True,
                     prob=0.15,
                 ),
+                *post_aug,
             ]
         )
 
