@@ -6,6 +6,8 @@
 dataset:
   task: crs
   enable_augmentations: true
+  spatial_augmentations: false 
+  intensity_augmentations: true 
 
 preprocessing:
   target_size: [512, 512, 96]
