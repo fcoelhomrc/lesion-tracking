@@ -17,6 +17,7 @@ loader:
   fold: 0
   num_workers: 8
   cases_per_batch: 8
+  weighted: true 
 
 training:
   lr: 1.0e-3
