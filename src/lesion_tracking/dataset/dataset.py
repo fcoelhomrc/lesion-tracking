@@ -1396,9 +1396,9 @@ def get_loader(
         weights = {k: 1 / freq for k, freq in case_freqs.items()}
         logger.info(
             f"Target frequencies: {
-                {k: np.round(v, 3) for k, v in target_freqs.items()}
+                {k: round(v, 3) for k, v in target_freqs.items()}
             } -> Weights: {
-                {k: np.round(1 / freq, 3) for k, freq in target_freqs.items()}
+                {k: round(1 / freq, 3) for k, freq in target_freqs.items()}
             }"
         )
 

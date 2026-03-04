@@ -88,6 +88,14 @@ run_pair() {
     [[ "$failed" -eq 0 ]] || exit 1
 }
 
+echo -e "\nClearing cache..."
+rm -rf "$DATASET_PATH/.cache"
+
+echo -e "\nPre-populating cache (no augmentations, single worker)..."
+uv run lesion-tracking-populate-cache \
+    +experiment=single_tp \
+    dataset.dataset_path="$DATASET_PATH"
+
 run_pair single_tp      single_tp_rope
 run_pair two_tp_diff    two_tp_mean
 run_pair two_tp_concat  two_tp_cross_attn

@@ -39,7 +39,7 @@ def train(cfg: Config) -> None:
         split="val",
         shuffle=False,
     )
-
+    # TODO: add hook to clear cache on train start
     assert isinstance(cfg.dataset.task, str), (
         "Training a classification module requires a valid 'task' to be selected"
     )
@@ -65,6 +65,16 @@ def train(cfg: Config) -> None:
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    # test_loader = make_loader(
+    #     cfg.dataset,
+    #     cfg.preprocessing,
+    #     cfg.loader,
+    #     split="test",
+    #     shuffle=False,
+    # )
+
+    # trainer.test(model, test_loader)
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")

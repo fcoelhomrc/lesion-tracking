@@ -65,6 +65,7 @@ def make_dataset(
     )
 
 
+# FIXME: refactor this mess (get_loader should not exist, and make_loader should probably use make_dataset internally)
 def make_loader(
     dataset_cfg: DatasetConfig,
     preprocessing_cfg: PreprocessingConfig,
