@@ -36,6 +36,7 @@ class LoaderConfig:
     cases_per_batch: int = 1
     num_workers: int = 1
     fold: int | None = None
+    weighted: bool = False
 
 
 def make_dataset(
@@ -86,4 +87,5 @@ def make_loader(
         num_workers=loader_cfg.num_workers,
         fold=loader_cfg.fold,
         split=split,
+        weighted=loader_cfg.weighted,
     )

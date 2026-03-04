@@ -1,6 +1,6 @@
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping, Sequence
@@ -562,6 +562,36 @@ class LongitudinalDataset(Dataset):
     def task(self) -> TaskDef | None:
         return self._task
 
+    def get_target(self, case_id: str) -> dict[str, int] | None:
+        target = None
+        case_metadata = self._metadata.get(case_id)
+        if case_metadata is not None:
+            target = parse_metadata(case_metadata, self._task.keys)
+            if target is not None and self._task.label_map is not None:
+                target = {k: self._task.label_map[v] for k, v in target.items()}
+        return target
+
+    @property
+    def target_frequencies(self) -> tuple[dict[int, float], dict[str, float]]:
+        assert len(self._task.keys) == 1, (
+            "target_frequencies only supports single-key tasks"
+        )
+        case_targets = {
+            case_id: next(iter(t.values()))
+            for case_id in self._cases
+            if (t := self.get_target(case_id)) is not None
+        }
+        class_counts = Counter(case_targets.values())
+        total = len(case_targets)
+        targets_to_frequency = {
+            label: class_counts[label] / total for label in set(case_targets.values())
+        }
+        cases_to_frequency = {
+            case_id: class_counts[label] / total
+            for case_id, label in case_targets.items()
+        }
+        return targets_to_frequency, cases_to_frequency
+
     def subset_by_cases(self, case_ids: list[str]) -> "LongitudinalDataset":
         """
         Filters accessible cases by mutating internal mappings.
@@ -606,11 +636,7 @@ class LongitudinalDataset(Dataset):
 
         target = None
         if self._task:
-            case_metadata = self._metadata.get(case_id)
-            if case_metadata is not None:
-                target = parse_metadata(case_metadata, self._task.keys)
-                if target is not None and self._task.label_map is not None:
-                    target = {k: self._task.label_map[v] for k, v in target.items()}
+            target = self.get_target(case_id)
 
         features = None
         if self._feature_groups:
@@ -880,17 +906,25 @@ class CaseGroupedBatchSampler(Sampler):
         dataset: LongitudinalDataset,
         cases_per_batch: int = 1,
         shuffle: bool = True,
+        weights: dict[str, float] | None = None,
     ):
         self.dataset = dataset
         self.cases_per_batch = cases_per_batch
         self.shuffle = shuffle
+        self.weights = weights
 
     def __iter__(self):
         import random
 
         case_ids = list(self.dataset.case_ids)
         if self.shuffle:
-            random.shuffle(case_ids)
+            if self.weights:
+                w = [self.weights.get(i, 1.0) for i in case_ids]
+                case_ids = random.choices(
+                    case_ids, weights=w, k=len(case_ids)
+                )  # resample with replacement
+            else:
+                random.shuffle(case_ids)  # permutation
 
         for i in range(0, len(case_ids), self.cases_per_batch):
             batch_cases = case_ids[i : i + self.cases_per_batch]
@@ -1306,6 +1340,7 @@ def get_loader(
     split: str | None = None,
     cases_per_batch: int = 1,
     shuffle: bool = False,
+    weighted: bool = False,
     num_workers: int = 1,
     scans_dir: str = "scans",
     masks_dir: str = "masks",
@@ -1329,6 +1364,19 @@ def get_loader(
         enable_augmentations=enable_augmentations,
     )
 
+    # TODO: support squared inverse weights, and square-root inverse weights
+    weights = None
+    if weighted:
+        target_freqs, case_freqs = dataset.target_frequencies
+        weights = {k: 1 / freq for k, freq in case_freqs.items()}
+        logger.info(
+            f"Target frequencies: {
+                {k: np.round(v, 3) for k, v in target_freqs.items()}
+            } -> Weights: {
+                {k: np.round(1 / freq, 3) for k, freq in target_freqs.items()}
+            }"
+        )
+
     if fold is not None:
         assert split is not None, f"No split was specified for fold {fold}"
         task_def = dataset.task
@@ -1346,7 +1394,10 @@ def get_loader(
         dataset.subset_by_cases(case_ids)
 
     batch_sampler = CaseGroupedBatchSampler(
-        dataset, cases_per_batch=cases_per_batch, shuffle=shuffle
+        dataset,
+        cases_per_batch=cases_per_batch,
+        shuffle=shuffle,
+        weights=weights,
     )
 
     loader = DataLoader(
@@ -1382,7 +1433,6 @@ if __name__ == "__main__":
     loader_cfg = LoaderConfig(
         cases_per_batch=2,
         fold=0,
-        split="train",
     )
 
     def test_dataset():
