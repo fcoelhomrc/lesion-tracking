@@ -29,6 +29,8 @@ class DatasetConfig:
     caching_strategy: str | None = "disk"
     cache_dir: str | None = None
     enable_augmentations: bool = True
+    spatial_augmentations: bool = False
+    intensity_augmentations: bool = True
 
 
 @dataclass
@@ -58,6 +60,8 @@ def make_dataset(
         caching_strategy=dataset_cfg.caching_strategy,
         cache_dir=dataset_cfg.cache_dir,
         enable_augmentations=dataset_cfg.enable_augmentations,
+        spatial_augmentations=dataset_cfg.spatial_augmentations,
+        intensity_augmentations=dataset_cfg.intensity_augmentations,
     )
 
 

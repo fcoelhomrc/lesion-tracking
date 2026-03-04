@@ -431,6 +431,8 @@ class LongitudinalDataset(Dataset):
         caching_strategy: str | None = "disk",
         cache_dir: str | None = None,
         enable_augmentations: bool = True,
+        spatial_augmentations: bool = False,
+        intensity_augmentations: bool = True,
     ) -> None:
         super().__init__()
 
@@ -455,6 +457,8 @@ class LongitudinalDataset(Dataset):
         self._cache_dir = cache_dir
 
         self._enable_augmentations = enable_augmentations
+        self._spatial_augmentations = spatial_augmentations
+        self._intensity_augmentations = intensity_augmentations
 
         self._build_full_pipeline()
         self._build_dataset()
@@ -716,10 +720,9 @@ class LongitudinalDataset(Dataset):
             "zscore": 0.1,  # heuristic: ~10% of unit std
         }[self._normalization]
 
-        self._augmentation_pipeline = Compose(
+        # Spatial augmentations
+        spatial_aug = (
             [
-                *pre_aug,
-                # Spatial transforms (scan + mask)
                 Rand3DElasticd(
                     keys=spatial_keys,
                     sigma_range=(5, 7),
@@ -752,7 +755,14 @@ class LongitudinalDataset(Dataset):
                     mode=("bilinear", "nearest"),
                     padding_mode="zeros",
                 ),
-                # Intensity transforms (scan only)
+            ]
+            if self._spatial_augmentations
+            else []
+        )
+
+        # Intensity augmentations
+        intensity_aug = (
+            [
                 RandGaussianNoised(
                     keys=["scan"],
                     std=noise_std,
@@ -776,6 +786,18 @@ class LongitudinalDataset(Dataset):
                     retain_stats=True,
                     prob=0.15,
                 ),
+            ]
+            if self._intensity_augmentations
+            else []
+        )
+
+        self._augmentation_pipeline = Compose(
+            [
+                *pre_aug,
+                # Spatial transforms (scan + mask)
+                *spatial_aug,
+                # Intensity transforms (scan only)
+                *intensity_aug,
                 *post_aug,
             ]
         )
@@ -913,6 +935,9 @@ class CaseGroupedBatchSampler(Sampler):
         self.shuffle = shuffle
         self.weights = weights
 
+    # NOTE: Weighted sampling is only used if `shuffle` is true
+    #       This is OK because `shuffle` is supposed to be used only with the train loader,
+    #       and weighted sampling w/ replacement also only makes sense during training.
     def __iter__(self):
         import random
 
