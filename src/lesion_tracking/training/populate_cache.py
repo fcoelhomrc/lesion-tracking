@@ -15,7 +15,7 @@ def main(raw_cfg: DictConfig) -> None:
     setup_logging()
     cfg: Config = OmegaConf.to_object(raw_cfg)  # type: ignore
 
-    # Disable augmentations — no point caching random transforms
+    # Disable augmentations, no point caching random transforms
     dataset_cfg = dataclasses.replace(
         cfg.dataset,
         enable_augmentations=False,
