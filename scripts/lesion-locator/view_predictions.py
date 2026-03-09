@@ -137,6 +137,11 @@ def main():
         default=DEFAULT_BASE / "screenshots",
         help=f"Directory for screenshots (default: {DEFAULT_BASE / 'screenshots'})",
     )
+    parser.add_argument(
+        "--no-labels",
+        action="store_true",
+        help="Hide GT and prediction labels (CT scan only)",
+    )
     args = parser.parse_args()
 
     case_id = args.case_id
@@ -205,30 +210,31 @@ def main():
 
     # Left: scan + GT
     viewer.add_image(scan_axial, name="scan", colormap="gray", scale=scale)
-    gt_layer = viewer.add_labels(
-        gt_axial, name="GT mask", opacity=0.5, colormap=SEG_COLORMAP, scale=scale
-    )
-    gt_layer.contour = 2
+    if not args.no_labels:
+        gt_layer = viewer.add_labels(
+            gt_axial, name="GT mask", opacity=0.5, colormap=SEG_COLORMAP, scale=scale
+        )
+        gt_layer.contour = 2
 
-    # Right: scan + prediction (offset in the X-axis of axial view)
-    offset = scan_axial.shape[2] * scale[2] + gap
-    translate = [0, 0, offset]
-    viewer.add_image(
-        scan_axial,
-        name="scan (pred)",
-        colormap="gray",
-        scale=scale,
-        translate=translate,
-    )
-    pred_layer = viewer.add_labels(
-        pred_axial,
-        name="Prediction",
-        opacity=0.5,
-        colormap=PRED_COLORMAP,
-        scale=scale,
-        translate=translate,
-    )
-    pred_layer.contour = 2
+        # Right: scan + prediction (offset in the X-axis of axial view)
+        offset = scan_axial.shape[2] * scale[2] + gap
+        translate = [0, 0, offset]
+        viewer.add_image(
+            scan_axial,
+            name="scan (pred)",
+            colormap="gray",
+            scale=scale,
+            translate=translate,
+        )
+        pred_layer = viewer.add_labels(
+            pred_axial,
+            name="Prediction",
+            opacity=0.5,
+            colormap=PRED_COLORMAP,
+            scale=scale,
+            translate=translate,
+        )
+        pred_layer.contour = 2
 
     @viewer.bind_key("s")
     def _soft_tissue_view(viewer):
@@ -291,40 +297,42 @@ def main():
             ),
         ]
 
+        suffix = "_nolabels" if args.no_labels else ""
         for i, (s, g, p, sc, angles, name) in enumerate(views, 1):
             vol_offset = s.shape[2] * sc[2] + gap
             v = napari.Viewer(title=f"{title} | {name}", show=True)
             v.add_image(
                 s, name="scan", colormap="gray", scale=sc, contrast_limits=BONE_CLIM
             )
-            gl = v.add_labels(
-                g, name="GT mask", opacity=0.5, colormap=SEG_COLORMAP, scale=sc
-            )
-            gl.contour = 2
-            v.add_image(
-                s,
-                name="scan (pred)",
-                colormap="gray",
-                scale=sc,
-                translate=[0, 0, vol_offset],
-                contrast_limits=BONE_CLIM,
-            )
-            pl = v.add_labels(
-                p,
-                name="Prediction",
-                opacity=0.5,
-                colormap=PRED_COLORMAP,
-                scale=sc,
-                translate=[0, 0, vol_offset],
-            )
-            pl.contour = 2
+            if not args.no_labels:
+                gl = v.add_labels(
+                    g, name="GT mask", opacity=0.5, colormap=SEG_COLORMAP, scale=sc
+                )
+                gl.contour = 2
+                v.add_image(
+                    s,
+                    name="scan (pred)",
+                    colormap="gray",
+                    scale=sc,
+                    translate=[0, 0, vol_offset],
+                    contrast_limits=BONE_CLIM,
+                )
+                pl = v.add_labels(
+                    p,
+                    name="Prediction",
+                    opacity=0.5,
+                    colormap=PRED_COLORMAP,
+                    scale=sc,
+                    translate=[0, 0, vol_offset],
+                )
+                pl.contour = 2
             v.dims.ndisplay = 3
             v.camera.angles = angles
             v.reset_view()
             v.camera.angles = angles
             img = v.screenshot(canvas_only=True, flash=False)
-            imwrite(out_dir / f"{prefix}_view{i}.png", img)
-            logger.info(f"Saved {prefix}_view{i}.png ({name})")
+            imwrite(out_dir / f"{prefix}{suffix}_view{i}.png", img)
+            logger.info(f"Saved {prefix}{suffix}_view{i}.png ({name})")
             v.close()
     else:
         napari.run()
